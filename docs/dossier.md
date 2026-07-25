@@ -1,0 +1,37 @@
+# dossier
+
+The documents in a dossier can be one of the following:
+
+```
+AangenomenMotie,
+    AangenomenTekst,
+    AanvullendVerslag,
+    Advies,
+    AdviesVanDeRaadVanState,
+    Amendement,
+    ArtikelenAangenomenInPlenum,
+    ArtikelenBijEersteStemmingAangenomen,
+    ArtikelenInTweedeLezingAangenomen,
+    Begroting,
+    Bijlage,
+    Errata,
+    Kaft,
+    Naturalisatielijsten,
+    NietGeevoceerdOntwerp,
+    OpmerkingenVanHetRekenhof,
+    OvergezondenOntwerp,
+    TabellenOfLijsten,
+    Verantwoording,
+    Verslag,
+    VerslagVerwijzend,
+    VoorstelOnderzoekscommissie,
+    VoorstelReglement,
+    VoorstelTotHerziening,
+    VoorstelVanResolutie,
+    VoorstelVanMotie,
+    VoorstelVanNaturalisatieAkte,
+    VoorstelVanVerklaring,
+    WetsOntwerp,
+    WetsVoorstel,
+    Onbekend,
+    ```
