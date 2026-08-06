@@ -94,17 +94,32 @@ _REDIRECT_PATTERN = re.compile(
 )
 
 
+# Trigger phrases indicating a "same as" redirect (Dutch + French, any variant:
+# plenary=committee, second reading=first reading, etc.)
+_REDIRECT_TRIGGER = re.compile(
+    r"is dezelfde als|est identique (?:à|au|aux)",
+    re.IGNORECASE,
+)
+
+# DOC citation, tolerant of "zie DOC", "voir DOC", "(DOC", "(zie DOC", etc.
+_DOC_REF_PATTERN = re.compile(
+    r"DOC\s+(\d+)\s+(\d+)\/(\d{3,4})",
+    re.IGNORECASE,
+)
+
+# How far past the trigger phrase we're willing to look for the DOC reference
+_REDIRECT_WINDOW = 250
+
+
 def detect_adopted_text_redirect(pdf_path: Path) -> Optional[str]:
     """
-    If the first page of *pdf_path* says the plenary text is the same as
-    the committee text and cites a DOC reference, return the URL of that
-    document.  Otherwise return None.
-
-    E.g. "DOC 56 1518/004"  →  https://www.dekamer.be/FLWB/PDF/56/1518/56K1518004.pdf
+    If the first page(s) of *pdf_path* say the text is the same as some
+    other DOC (plenary==committee, second reading==first reading, etc.)
+    and cite a DOC reference nearby, return the URL of that document.
+    Otherwise return None.
     """
     try:
         doc = fitz.open(pdf_path)
-        # Only check the first 1-2 pages
         text = ""
         for page in doc[: min(2, len(doc))]:
             text += page.get_text()
@@ -112,12 +127,16 @@ def detect_adopted_text_redirect(pdf_path: Path) -> Optional[str]:
     except Exception:
         return None
 
-    m = _REDIRECT_PATTERN.search(text)
+    trig = _REDIRECT_TRIGGER.search(text)
+    if not trig:
+        return None
+
+    window = text[trig.end(): trig.end() + _REDIRECT_WINDOW]
+    m = _DOC_REF_PATTERN.search(window)
     if not m:
         return None
 
     session_str, dossier_str, seq_str = m.group(1), m.group(2), m.group(3)
-    # seq_str may be "004" → keep zero-padding as-is
     filename = f"{session_str}K{dossier_str}{seq_str}.pdf"
     url = f"https://www.dekamer.be/FLWB/PDF/56/{dossier_str}/{filename}"
     tqdm.write(f"  [redirect] DOC {session_str} {dossier_str}/{seq_str} → {url}")

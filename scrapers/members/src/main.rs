@@ -9,7 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::ArrowWriter;
 use regex::{Captures, Regex};
 use scraper::{ElementRef, Html, Selector};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{File, read_to_string};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -154,6 +154,24 @@ fn selector_detail_page_link() -> &'static Selector {
 fn selector_email() -> &'static Selector {
     SELECTOR_EMAIL.get_or_init(|| Selector::parse("tr a[href*='mailto:']").unwrap())
 }
+
+static FRACTION_DISPLAY_NAMES: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        HashMap::from([
+            ("cd&v", "CD&V"),
+            ("anders.", "Anders."),
+            ("vb", "VB"),
+            ("pvda-ptb", "PVDA-PTB"),
+            ("ps", "PS"),
+            ("ecolo-groen!", "Ecolo-Groen!"),
+            ("mr", "MR"),
+            ("n-va", "N-VA"),
+            ("vooruit", "Vooruit"),
+            ("onafh", "ONAFH"),
+            ("les engagés", "Les Engagés"),
+            ("défi", "DéFI"),
+        ])
+    });
 
 /// A scraped member.
 #[derive(Debug)]
@@ -428,6 +446,8 @@ async fn extract_members(
             fraction
         };
 
+        let fraction = capitalize_fraction(&fraction);
+
         let (van_tot_start, van_tot_end) = extract_van_tot_period(paragraph.as_deref());
         let (period_start, period_end) = extract_period_dates(&detail, session_id);
 
@@ -501,6 +521,25 @@ fn fix_raw_name(raw: String) -> String {
         "Dedecker Jean Marie" => "Dedecker Jean-Marie".to_string(),
         _ => raw,
     }
+}
+
+fn capitalize_fraction(fraction: &str) -> String {
+    FRACTION_DISPLAY_NAMES
+        .get(fraction)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            fraction
+                .split_whitespace()
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
 }
 
 /// Extract the member's fraction from the given paragraph.

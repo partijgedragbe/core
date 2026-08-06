@@ -798,6 +798,40 @@ async fn extract_questions(
             }
         }
     }
+
+    // Fix duplicated internal question IDs caused by incorrect codes in the plenary report.
+    // Example: IP005 contains both 56000005P and 56000005P, but the first question
+    // ("Het uitstellen van de indiening van het begrotingsplan bij de EU")
+    // should actually be 56000006P.
+    let mut seen_internal_ids: HashMap<String, usize> = HashMap::new();
+
+    for question in &mut questions {
+        let internal_ids = question
+            .internal_ids
+            .split(',')
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        for internal_id in internal_ids {
+            if internal_id.is_empty() {
+                continue;
+            }
+
+            let count = seen_internal_ids.entry(internal_id.clone()).or_insert(0);
+
+            *count += 1;
+
+            if *count > 1
+                && internal_id == "Q56000005P"
+                && question
+                    .topics_nl
+                    .contains("Het uitstellen van de indiening van het begrotingsplan bij de EU")
+            {
+                question.internal_ids = question.internal_ids.replace("Q56000005P", "Q56000006P");
+            }
+        }
+    }
+
     Ok(questions)
 }
 
