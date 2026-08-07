@@ -23,6 +23,7 @@ static PARAGRAPH_VOTE_SECTION_REGEX: OnceLock<Regex> = OnceLock::new();
 static QUESTION_REGEX: OnceLock<Regex> = OnceLock::new();
 static TIME_REGEX: OnceLock<Regex> = OnceLock::new();
 static DATE_REGEX: OnceLock<Regex> = OnceLock::new();
+static DATE_NUMERIC_REGEX: OnceLock<Regex> = OnceLock::new();
 static SPEAKER_REGEX: OnceLock<Regex> = OnceLock::new();
 static SPEAKER_NAME_REGEX: OnceLock<Regex> = OnceLock::new();
 static TITLES_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -50,11 +51,15 @@ fn question_regex() -> &'static Regex {
 }
 
 fn time_regex() -> &'static Regex {
-    TIME_REGEX.get_or_init(|| Regex::new(r"(\d{1,2})\.(\d{2})\s*uur").unwrap())
+    TIME_REGEX.get_or_init(|| Regex::new(r"(\d{1,2})\.(\d{2})\s*(?:uur|u)").unwrap())
 }
 
 fn date_regex() -> &'static Regex {
     DATE_REGEX.get_or_init(|| Regex::new(r"(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})").unwrap())
+}
+
+fn date_numeric_regex() -> &'static Regex {
+    DATE_NUMERIC_REGEX.get_or_init(|| Regex::new(r"(\d{1,2})-(\d{1,2})-(\d{4})").unwrap())
 }
 
 fn speaker_regex() -> &'static Regex {
@@ -397,25 +402,43 @@ fn write_notices(path: &Path, rows: &[ScrapedNotice]) -> Result<(), Box<dyn Erro
     )
 }
 
+const SESSION_IDS: &[u32] = &[56, 55];
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
-
     let client = ScrapingClient::new();
-    let session_id: u32 = 56;
 
+    for &session_id in SESSION_IDS {
+        if let Err(err) = scrape_session(&client, session_id).await {
+            eprintln!(
+                "[meetings-plenary] session {} failed entirely: {}",
+                session_id, err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Scrape a single session.
+async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), Box<dyn Error>> {
     let session_dir = data_dir()
         .join("sessions")
         .join(session_id.to_string())
         .join("plenary");
     fs::create_dir_all(&session_dir).await?;
 
-    let meeting_id_path = data_dir().join("current_plenary_id.txt");
-    let current_meeting_id: u32 = std::fs::read_to_string(&meeting_id_path)?.trim().parse()?;
+    let meeting_id_path = session_dir.join("current_plenary_id.txt");
+    let current_meeting_id: u32 = if meeting_id_path.exists() {
+        std::fs::read_to_string(&meeting_id_path)?.trim().parse()?
+    } else {
+        0
+    };
 
     let mut web_request_count = 0u32;
     let last_meeting_id = discover_last_meeting_id(
-        &client,
+        client,
         session_id,
         current_meeting_id,
         &mut web_request_count,
@@ -423,11 +446,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     if last_meeting_id == current_meeting_id {
-        println!("[meetings-plenary] no new meeting available to download");
+        println!(
+            "[meetings-plenary] session {}: no new meeting available to download",
+            session_id
+        );
     } else {
         println!(
-            "[meetings-plenary] found new meetings up to {}",
-            last_meeting_id
+            "[meetings-plenary] session {}: found new meetings up to {}",
+            session_id, last_meeting_id
         );
     }
 
@@ -439,23 +465,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mp = MultiProgress::new();
     let meetings_pb = mp.add(ProgressBar::new(last_meeting_id as u64));
-    meetings_pb.set_style(
-        ProgressStyle::with_template(
-            "[meetings-plenary] [{elapsed_precise}] {spinner:.blue} {bar:40.cyan/blue} {pos}/{len} ({percent}%) | {msg}",
-        )?
-        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    let template = format!(
+        "[meetings-plenary] session {} [{{elapsed_precise}}] {{spinner:.blue}} {{bar:40.cyan/blue}} {{pos}}/{{len}} ({{percent}}%) | {{msg}}",
+        session_id
     );
-
+    meetings_pb.set_style(ProgressStyle::with_template(&template)?.tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"));
     meetings_pb.set_message(web_request_count.to_string());
 
-    // Collect dossier ids mentioned within the meetings
     let mut encountered_dossier_ids: HashMap<String, String> = HashMap::new();
 
     for meeting_id in 1..=last_meeting_id {
         meetings_pb.set_message(format!("reqs={} meeting={}", web_request_count, meeting_id));
-
         match scrape_meeting(
-            &client,
+            client,
             session_id,
             meeting_id,
             &mut web_request_count,
@@ -471,7 +493,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 all_votes.extend(output.votes);
             }
             Err(err) => {
-                eprintln!("[meetings-plenary] failed meeting {}: {}", meeting_id, err);
+                eprintln!(
+                    "[meetings-plenary] session {}: failed meeting {}: {}",
+                    session_id, meeting_id, err
+                );
             }
         };
 
@@ -489,7 +514,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     std::fs::write(&ids_path, lines.join("\n"))?;
 
     meetings_pb.finish_with_message("done");
-
     std::fs::write(&meeting_id_path, last_meeting_id.to_string())?;
 
     write_meetings(&session_dir.join("meetings.parquet"), &all_meetings)?;
@@ -499,10 +523,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     write_votes(&session_dir.join("votes.parquet"), &all_votes)?;
 
     println!(
-        "[meetings-plenary] scraped {} meetings using {} web requests",
+        "[meetings-plenary] session {}: scraped {} meetings using {} web requests",
+        session_id,
         all_meetings.len(),
         web_request_count
     );
+
     Ok(())
 }
 
@@ -799,39 +825,6 @@ async fn extract_questions(
         }
     }
 
-    // Fix duplicated internal question IDs caused by incorrect codes in the plenary report.
-    // Example: IP005 contains both 56000005P and 56000005P, but the first question
-    // ("Het uitstellen van de indiening van het begrotingsplan bij de EU")
-    // should actually be 56000006P.
-    let mut seen_internal_ids: HashMap<String, usize> = HashMap::new();
-
-    for question in &mut questions {
-        let internal_ids = question
-            .internal_ids
-            .split(',')
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-
-        for internal_id in internal_ids {
-            if internal_id.is_empty() {
-                continue;
-            }
-
-            let count = seen_internal_ids.entry(internal_id.clone()).or_insert(0);
-
-            *count += 1;
-
-            if *count > 1
-                && internal_id == "Q56000005P"
-                && question
-                    .topics_nl
-                    .contains("Het uitstellen van de indiening van het begrotingsplan bij de EU")
-            {
-                question.internal_ids = question.internal_ids.replace("Q56000005P", "Q56000006P");
-            }
-        }
-    }
-
     Ok(questions)
 }
 
@@ -903,24 +896,28 @@ async fn extract_propositions(
             .next();
 
         // Collect the actual title text, skipping pure-digit spans.
-        let text: String = element
+        let spans: Vec<String> = element
             .select(selector_span())
             .filter_map(|span| {
                 let raw = clean_text(&span.text().collect::<Vec<_>>().join(" "))
                     .replace("\"", "'")
                     .trim()
                     .to_string();
+
                 if raw.is_empty() || raw.chars().all(|c| c.is_ascii_digit()) {
                     None
                 } else {
                     Some(raw)
                 }
             })
-            .collect::<Vec<_>>()
-            .last() // NOTE: We pick the last one but why? Otherwise I got duplicates.
-            .unwrap()
-            .trim()
-            .to_string();
+            .collect();
+
+        if spans.is_empty() {
+            eprintln!("Empty h2: {}", element.html());
+            continue;
+        }
+
+        let text = spans.last().unwrap().trim().to_string();
 
         if text.is_empty() {
             continue;
@@ -1048,24 +1045,28 @@ async fn extract_notices(
             .next();
 
         // Collect the actual title text, skipping pure-digit spans.
-        let text: String = element
+        let spans: Vec<String> = element
             .select(selector_span())
             .filter_map(|span| {
                 let raw = clean_text(&span.text().collect::<Vec<_>>().join(" "))
                     .replace("\"", "'")
                     .trim()
                     .to_string();
+
                 if raw.is_empty() || raw.chars().all(|c| c.is_ascii_digit()) {
                     None
                 } else {
                     Some(raw)
                 }
             })
-            .collect::<Vec<_>>()
-            .last() // NOTE: We pick the last one but why? Otherwise I got duplicates.
-            .unwrap()
-            .trim()
-            .to_string();
+            .collect();
+
+        if spans.is_empty() {
+            eprintln!("Empty h2: {}", element.html());
+            continue;
+        }
+
+        let text = spans.last().unwrap().trim().to_string();
 
         if text.is_empty() {
             continue;
@@ -1647,6 +1648,16 @@ fn extract_question_data(
             .map(|m| format!("Q{}", m.as_str().trim()))
             .unwrap_or_default();
 
+        // One-off fix: this specific question was mis-numbered in the source
+        // document (should be 56000006P, not 56000005P).
+        let internal_id = if internal_id == "Q56000005P"
+            && topic == "Het uitstellen van de indiening van het begrotingsplan bij de EU"
+        {
+            "Q56000006P".to_string()
+        } else {
+            internal_id
+        };
+
         questioners.push(questioner.clone());
         if !questionees.contains(&questionee) {
             questionees.push(questionee);
@@ -1973,6 +1984,7 @@ fn convert_name(name: &str) -> String {
     }
 }
 
+/// Extracts the date of the plenary meeting.
 fn extract_date_from_document(document: &Html) -> Result<String, Box<dyn Error>> {
     let first_table = document
         .select(selector_table())
@@ -1985,12 +1997,26 @@ fn extract_date_from_document(document: &Html) -> Result<String, Box<dyn Error>>
         .collect::<Vec<_>>()
         .join(" ");
 
-    let caps = date_regex()
-        .captures(&text)
-        .ok_or("Could not find date in document")?;
+    // Format 1: "10 november 2021"
+    if let Some(caps) = date_regex().captures(&text) {
+        let day = format!("{:02}", caps[1].parse::<u8>()?);
+        let month = month_name_to_number(&caps[2])?;
+        return Ok(format!("{}-{}-{}", &caps[3], month, day));
+    }
 
-    let day = format!("{:02}", caps[1].parse::<u8>()?);
-    let month = match &caps[2].to_lowercase()[..] {
+    // Format 2): "3-10-2019" (used in plenary meeting 55007)
+    if let Some(caps) = date_numeric_regex().captures(&text) {
+        let day = format!("{:02}", caps[1].parse::<u8>()?);
+        let month = format!("{:02}", caps[2].parse::<u8>()?);
+        return Ok(format!("{}-{}-{}", &caps[3], month, day));
+    }
+
+    Err("Could not find date in document".into())
+}
+
+fn month_name_to_number(name: &str) -> Result<&'static str, Box<dyn Error>> {
+    Ok(match &name.to_lowercase()[..] {
+        // Dutch
         "januari" => "01",
         "februari" => "02",
         "maart" => "03",
@@ -2003,9 +2029,21 @@ fn extract_date_from_document(document: &Html) -> Result<String, Box<dyn Error>>
         "oktober" => "10",
         "november" => "11",
         "december" => "12",
-        _ => return Err("Invalid month name".into()),
-    };
-    Ok(format!("{}-{}-{}", &caps[3], month, day))
+        // French
+        "janvier" => "01",
+        "février" | "fevrier" => "02",
+        "mars" => "03",
+        "avril" => "04",
+        "mai" => "05",
+        "juin" => "06",
+        "juillet" => "07",
+        "août" | "aout" => "08",
+        "septembre" => "09",
+        "octobre" => "10",
+        "novembre" => "11",
+        "décembre" | "decembre" => "12",
+        other => return Err(format!("Invalid month name: {}", other).into()),
+    })
 }
 
 fn extract_time_of_day_from_document(document: &Html) -> Result<String, Box<dyn Error>> {
@@ -2037,6 +2075,7 @@ fn extract_end_time_from_document(document: &Html) -> Result<String, Box<dyn Err
     [
         "De vergadering wordt gesloten",
         "De vergadering wordt geschorst",
+        "De openbare commissievergadering wordt gesloten", // IP55039
     ]
     .iter()
     .find_map(|phrase| extract_time_from_document(document, phrase).ok())
