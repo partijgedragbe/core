@@ -548,19 +548,43 @@ async fn discover_last_meeting_id(
     web_request_count: &mut u32,
 ) -> Result<u32, Box<dyn Error>> {
     let mut last = current_id;
+
+    println!(
+        "[meetings-plenary] discovering meetings for session {}, starting at {}",
+        session_id, current_id
+    );
+
     loop {
         let probe = last + 1;
+
+        println!("[meetings-plenary] probing meeting {}...", probe);
+
         let url = format!(
             "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
             session_id, probe
         );
+
         let resp = client.get(&url).await?;
         *web_request_count += 1;
+
+        println!(
+            "[meetings-plenary] meeting {} -> HTTP {}",
+            probe,
+            resp.status()
+        );
+
         if resp.status() == StatusCode::NOT_FOUND {
             break;
         }
+
         last = probe;
     }
+
+    println!(
+        "[meetings-plenary] last meeting for session {} = {}",
+        session_id, last
+    );
+
     Ok(last)
 }
 
