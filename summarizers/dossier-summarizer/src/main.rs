@@ -130,13 +130,22 @@ Je antwoordt ALTIJD uitsluitend met geldig JSON. \
 Geen extra tekst, geen uitleg, geen markdown code-blokken — enkel de JSON."
 }
 
-fn user_prompt_content(content: &str, is_adopted: bool) -> String {
-    let intro = if is_adopted {
+fn user_prompt_content(content: &str, is_adopted: bool, has_original_context: bool) -> String {
+    let intro = if is_adopted && has_original_context {
+        "Je krijgt hieronder twee delen van hetzelfde dossier. Eerst de ORIGINELE TEKST van het \
+       parlementair voorstel — deze bevat vaak een memorie van toelichting of inleidende samenvatting \
+       die het onderwerp, de motivering en de context helder uitlegt. Daarna volgt de AANGENOMEN TEKST, \
+       de definitieve juridische tekst zoals aangenomen door de Kamer. Deze aangenomen tekst bestaat vaak \
+       uit een artikelsgewijze wijziging van bestaande wetgeving en is op zichzelf moeilijk te interpreteren. \
+       Gebruik de originele tekst om het onderwerp, de motivering en de context te begrijpen, maar baseer \
+       je beschrijving van de UITEINDELIJKE inhoud en de concrete gevolgen op de aangenomen tekst, aangezien \
+       die de geldende wetgeving weergeeft."
+    } else if is_adopted {
         "Je krijgt de volledige tekst van een aangenomen parlementaire tekst."
     } else {
         "Je krijgt de volledige tekst van een parlementair voorstel dat NIET werd aangenomen door de Kamer \
-    (verworpen of zonder voorwerp verklaard). Behandel de tekst uitdrukkelijk als een voorstel, niet als geldende wetgeving, \
-    en maak dit waar relevant duidelijk in de samenvatting."
+       (verworpen of zonder voorwerp verklaard). Behandel de tekst uitdrukkelijk als een voorstel, niet als geldende wetgeving, \
+       en maak dit waar relevant duidelijk in de samenvatting."
     };
     format!(
         "{intro} \
@@ -597,7 +606,7 @@ async fn main() {
     let mistral_api_key = std::env::var("MISTRAL_API_TOKEN").expect("Missing MISTRAL_API_TOKEN");
 
     // Optional: pass a single dossier ID as a CLI argument for testing.
-    let single_dossier: Option<String> = Some(String::from("1385")); //std::env::args().nth(1);
+    let single_dossier: Option<String> = Some(String::from("1164")); //std::env::args().nth(1);
     let client = Client::new();
     let dossiers_base = cache_dir().join("sessions/56/dossiers/pdfs");
     let content_out = data_dir().join("summaries/dossier_content.parquet");
@@ -638,27 +647,57 @@ async fn main() {
     for dossier_id in &dossier_ids {
         let dossier_dir = dossiers_base.join(dossier_id);
 
-        // Summarize adopted text or original text
+        // Summarize adopted text or original text.
+        // If a dossier was adopted, the adopted text is often just a line-by-line
+        // amendment to existing law, which is hard for the LLM to interpret on its
+        // own. The original text — especially when the government is the author —
+        // frequently contains a memorie van toelichting / summary that explains the
+        // subject matter. So when both exist, we feed both to the model: the
+        // original for context, the adopted text as the authoritative outcome.
         let adopted_path = dossier_dir.join("adopted_text.md");
         let original_path = dossier_dir.join("original_text.md");
 
-        let (source_path, is_adopted) = if adopted_path.exists() {
-            (Some(adopted_path), true)
-        } else if original_path.exists() {
-            (Some(original_path), false)
-        } else {
-            (None, true)
+        let adopted_content = std::fs::read_to_string(&adopted_path)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let original_content = std::fs::read_to_string(&original_path)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        let is_adopted = adopted_content.is_some();
+        let has_original_context = adopted_content.is_some() && original_content.is_some();
+
+        let combined: Option<(String, String)> = match (&adopted_content, &original_content) {
+            (Some(adopted), Some(original)) => Some((
+                format!(
+                    "=== ORIGINELE TEKST (context / memorie van toelichting) ===\n{original}\n\n\
+                     === AANGENOMEN TEKST (definitieve, geldende juridische tekst) ===\n{adopted}"
+                ),
+                format!(
+                    "adopted_text.md ({}) + original_text.md ({})",
+                    adopted_path.display(),
+                    original_path.display()
+                ),
+            )),
+            (Some(adopted), None) => Some((
+                adopted.clone(),
+                format!("adopted_text.md ({})", adopted_path.display()),
+            )),
+            (None, Some(original)) => Some((
+                original.clone(),
+                format!("original_text.md ({})", original_path.display()),
+            )),
+            (None, None) => None,
         };
 
-        if let Some(text_path) = source_path {
-            let content = std::fs::read_to_string(&text_path).unwrap_or_default();
+        if let Some((content, source)) = combined {
             let trimmed_content = content.trim();
             if trimmed_content.len() < 500 {
                 eprintln!(
-                    "[summarizer] WARNING: skipping dossier {dossier_id} adopted_text.md — content too short ({} chars < 500)",
+                    "[summarizer] WARNING: skipping dossier {dossier_id} content — combined length too short ({} chars < 500)",
                     trimmed_content.len()
                 );
-            } else if !content.trim().is_empty() {
+            } else {
                 let hash = hash_text(&content);
                 let needs_regen = match content_cache.get(&hash) {
                     Some(existing) => !existing.is_complete(),
@@ -667,13 +706,15 @@ async fn main() {
                 if needs_regen {
                     pb.set_message(format!(
                         "api_calls={total_calls} — summarizing {} for dossier {dossier_id}",
-                        if is_adopted {
+                        if has_original_context {
+                            "adopted text + original context"
+                        } else if is_adopted {
                             "adopted text"
                         } else {
                             "original (rejected) text"
                         }
                     ));
-                    let user = user_prompt_content(&content, is_adopted);
+                    let user = user_prompt_content(&content, is_adopted, has_original_context);
                     if let Some(raw_response) = mistral_complete(
                         &client,
                         &mistral_api_key,
@@ -687,11 +728,6 @@ async fn main() {
                     {
                         let parsed = parse_adopted_text_summary_response(&raw_response);
                         check_seo_lengths(dossier_id, &parsed.title, &parsed.description);
-                        let source = format!(
-                            "{} ({})",
-                            text_path.file_name().unwrap().to_string_lossy(),
-                            text_path.display()
-                        );
                         content_cache.insert(
                             hash.clone(),
                             CachedAdoptedTextSummaries {
