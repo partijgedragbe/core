@@ -407,6 +407,7 @@ const SESSION_IDS: &[u32] = &[56, 55];
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
+
     let client = ScrapingClient::new();
 
     for &session_id in SESSION_IDS {

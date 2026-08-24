@@ -232,7 +232,7 @@ fn write_parquet(
 fn write_meetings(path: &Path, rows: &[ScrapedMeeting]) -> Result<(), Box<dyn Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
-        Field::new("commission_id", DataType::Utf8, false),
+        Field::new("meeting_id", DataType::Utf8, false),
         Field::new("date", DataType::Utf8, false),
         Field::new("time_of_day", DataType::Utf8, false),
         Field::new("start_time", DataType::Utf8, false),
@@ -289,21 +289,40 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
     )
 }
 
+const SESSION_IDS: &[u32] = &[56, 55];
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
     let client = ScrapingClient::new();
-    let session_id: u32 = 56;
 
+    for &session_id in SESSION_IDS {
+        if let Err(err) = scrape_session(&client, session_id).await {
+            eprintln!(
+                "[meetings-commission] session {} failed entirely: {}",
+                session_id, err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Scrape a single session.
+async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), Box<dyn Error>> {
     let session_dir = data_dir()
         .join("sessions")
         .join(session_id.to_string())
         .join("commission");
     fs::create_dir_all(&session_dir).await?;
 
-    let meeting_id_path = data_dir().join("current_commission_id.txt");
-    let current_meeting_id: u32 = std::fs::read_to_string(&meeting_id_path)?.trim().parse()?;
+    let meeting_id_path = session_dir.join("current_commission_id.txt");
+    let current_meeting_id: u32 = if meeting_id_path.exists() {
+        std::fs::read_to_string(&meeting_id_path)?.trim().parse()?
+    } else {
+        0
+    };
 
     let mut web_request_count = 0u32;
     let last_meeting_id = discover_last_meeting_id(
@@ -359,7 +378,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     meetings_pb.finish_with_message("done");
-
     std::fs::write(&meeting_id_path, last_meeting_id.to_string())?;
 
     write_meetings(&session_dir.join("meetings.parquet"), &all_meetings)?;
@@ -380,26 +398,51 @@ async fn discover_last_meeting_id(
     web_request_count: &mut u32,
 ) -> Result<u32, Box<dyn Error>> {
     let mut last = current_id;
+    let mut probe = current_id + 1;
     let mut misses = 0;
+
+    println!(
+        "[meetings-commission] discovering meetings for session {}, starting at {}",
+        session_id, current_id
+    );
+
     loop {
-        let probe = last + 1;
+        println!("[meetings-commission] probing meeting {}...", probe);
+
         let url = format!(
             "https://www.dekamer.be/doc/CCRI/html/{}/ic{:03}x.html",
             session_id, probe
         );
+
         let resp = client.get(&url).await?;
         *web_request_count += 1;
+
+        println!(
+            "[meetings-commission] meeting {} -> HTTP {}",
+            probe,
+            resp.status()
+        );
+
         if resp.status() == StatusCode::NOT_FOUND {
             misses += 1;
-            // Allow up to 2 missing reports before giving up (commission IDs can have gaps).
-            if misses >= 2 {
+
+            // Allow up to 3 consecutive missing meeting IDs.
+            if misses > 3 {
                 break;
             }
         } else {
             last = probe;
             misses = 0;
         }
+
+        probe += 1;
     }
+
+    println!(
+        "[meetings-commission] last meeting for session {} = {}",
+        session_id, last
+    );
+
     Ok(last)
 }
 
