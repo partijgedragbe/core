@@ -110,7 +110,7 @@ struct ScrapedQuestion {
     topics_nl: String,
     topics_fr: String,
     discussion: String,
-    dossier_ids: String,
+    internal_ids: String,
     date: String,
 }
 
@@ -125,7 +125,7 @@ struct QuestionData {
     respondents: Vec<String>,
     topics: Vec<String>,
     discussion: String,
-    dossier_ids: Vec<String>,
+    internal_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -267,7 +267,7 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
         Field::new("topics_nl", DataType::Utf8, false),
         Field::new("topics_fr", DataType::Utf8, false),
         Field::new("discussion", DataType::Utf8, false),
-        Field::new("dossier_ids", DataType::Utf8, false),
+        Field::new("internal_ids", DataType::Utf8, false),
         Field::new("date", DataType::Utf8, false),
     ]));
     write_parquet(
@@ -283,7 +283,7 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
             col!(rows, |q| q.topics_nl.clone()),
             col!(rows, |q| q.topics_fr.clone()),
             col!(rows, |q| q.discussion.clone()),
-            col!(rows, |q| q.dossier_ids.clone()),
+            col!(rows, |q| q.internal_ids.clone()),
             col!(rows, |q| q.date.clone()),
         ],
     )
@@ -482,7 +482,8 @@ async fn scrape_meeting(
     let chair = extract_chair_from_document(&document)?;
     let commission = extract_commission_from_document(&document)?;
 
-    let questions = extract_questions(&document, session_id, meeting_id, &date)?;
+    let mut questions = extract_questions(&document, session_id, meeting_id, &date)?;
+    // merge_duplicate_questions(&mut questions);
 
     Ok(MeetingOutput {
         meeting: ScrapedMeeting {
@@ -535,7 +536,7 @@ fn extract_questions(
             topics_nl: data_nl.topics.join(";"),
             topics_fr: data_fr.topics.join(";"),
             discussion: data_nl.discussion,
-            dossier_ids: data_nl.dossier_ids.join(","),
+            internal_ids: data_nl.internal_ids.join(","),
             date: date.to_string(),
         }))
     };
@@ -738,7 +739,7 @@ fn extract_question_data(
     let mut questioners = Vec::new();
     let mut topics = Vec::new();
     let mut questionees = Vec::new();
-    let mut dossier_ids = Vec::new();
+    let mut internal_ids = Vec::new();
 
     for capture in question_regex().captures_iter(question_text) {
         let questioner = capture[1]
@@ -758,7 +759,7 @@ fn extract_question_data(
         if !questionees.contains(&questionee) {
             questionees.push(questionee);
         }
-        dossier_ids.push(dossier_id);
+        internal_ids.push(dossier_id);
         topics.push(topic);
     }
 
@@ -775,7 +776,7 @@ fn extract_question_data(
         respondents,
         topics,
         discussion: get_discussion_json(discussion_text),
-        dossier_ids,
+        internal_ids,
     })
 }
 
@@ -1021,4 +1022,71 @@ fn extract_commission_from_document(document: &Html) -> Result<String, Box<dyn E
         .join(" ");
 
     Ok(parse_commission_type(&raw).to_string())
+}
+
+fn merge_duplicate_questions(questions: &mut Vec<ScrapedQuestion>) {
+    let mut merged: Vec<ScrapedQuestion> = Vec::with_capacity(questions.len());
+
+    for question in questions.drain(..) {
+        let duplicate_idx = merged.iter().position(|existing| {
+            existing.session_id == question.session_id
+                && existing.meeting_id == question.meeting_id
+                && existing.date == question.date
+                && existing.internal_ids == question.internal_ids
+                && existing.questioners == question.questioners
+                && existing.questionees == question.questionees
+                && existing.topics_nl == question.topics_nl
+                && existing.topics_fr == question.topics_fr
+        });
+
+        if let Some(idx) = duplicate_idx {
+            let existing = &mut merged[idx];
+
+            eprintln!(
+                "[meetings-commission] WARNING: merging duplicate question {} into question {} \
+                 (meeting {}, internal_ids={})",
+                question.question_id,
+                existing.question_id,
+                question.meeting_id,
+                question.internal_ids
+            );
+
+            existing.respondents = merge_csv_values(&existing.respondents, &question.respondents);
+
+            existing.discussion = merge_discussion_json(&existing.discussion, &question.discussion);
+        } else {
+            merged.push(question);
+        }
+    }
+
+    *questions = merged;
+
+    // Re-number question IDs after merging.
+    for (idx, question) in questions.iter_mut().enumerate() {
+        question.question_id = idx as i32;
+    }
+}
+
+fn merge_csv_values(left: &str, right: &str) -> String {
+    let mut values = Vec::new();
+
+    for value in left.split(',').chain(right.split(',')) {
+        let value = value.trim();
+
+        if !value.is_empty() && !values.iter().any(|v| v == value) {
+            values.push(value.to_string());
+        }
+    }
+
+    values.join(",")
+}
+
+fn merge_discussion_json(left: &str, right: &str) -> String {
+    let mut left_value: Vec<serde_json::Value> = serde_json::from_str(left).unwrap_or_default();
+
+    let right_value: Vec<serde_json::Value> = serde_json::from_str(right).unwrap_or_default();
+
+    left_value.extend(right_value);
+
+    serde_json::to_string_pretty(&left_value).unwrap_or_else(|_| left.to_string())
 }
