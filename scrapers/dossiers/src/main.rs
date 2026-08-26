@@ -839,7 +839,7 @@ fn parse_document_type(raw: &str) -> DocumentType {
 fn write_dossiers(path: &Path, rows: &[ScrapedDossier]) -> Result<(), Box<dyn Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
-        Field::new("id", DataType::Utf8, false),
+        Field::new("dossier_id", DataType::Utf8, false),
         Field::new("last_updated", DataType::Utf8, false),
         Field::new("title", DataType::Utf8, false),
         Field::new("authors", DataType::Utf8, false),
