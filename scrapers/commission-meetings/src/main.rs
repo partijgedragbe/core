@@ -290,6 +290,7 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
 }
 
 const SESSION_IDS: &[u32] = &[56, 55];
+const LATEST_SESSION_ID: u32 = 56;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -325,13 +326,17 @@ async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), 
     };
 
     let mut web_request_count = 0u32;
-    let last_meeting_id = discover_last_meeting_id(
-        &client,
-        session_id,
-        current_meeting_id,
-        &mut web_request_count,
-    )
-    .await?;
+    let last_meeting_id = if session_id == LATEST_SESSION_ID {
+        discover_last_meeting_id(
+            client,
+            session_id,
+            current_meeting_id,
+            &mut web_request_count,
+        )
+        .await?
+    } else {
+        current_meeting_id
+    };
 
     if last_meeting_id == current_meeting_id {
         println!("[meetings-commission] no new meeting available to download");
@@ -482,8 +487,7 @@ async fn scrape_meeting(
     let chair = extract_chair_from_document(&document)?;
     let commission = extract_commission_from_document(&document)?;
 
-    let mut questions = extract_questions(&document, session_id, meeting_id, &date)?;
-    // merge_duplicate_questions(&mut questions);
+    let questions = extract_questions(&document, session_id, meeting_id, &date)?;
 
     Ok(MeetingOutput {
         meeting: ScrapedMeeting {
@@ -516,10 +520,10 @@ fn extract_questions(
     let french_indicators = ["questions jointes", "question de"];
     let dutch_indicators = ["samengevoegde vragen", "toegevoegde vragen", "vraag van"];
 
-    let flush = |id: i32,
-                 nl: &str,
-                 fr: &str,
-                 discussion: &str|
+    let flush_question = |id: i32,
+                          nl: &str,
+                          fr: &str,
+                          discussion: &str|
      -> Result<Option<ScrapedQuestion>, Box<dyn Error>> {
         if nl.is_empty() && fr.is_empty() {
             return Ok(None);
@@ -597,7 +601,7 @@ fn extract_questions(
                 // Flush any pending question that came before this hearing,
                 // then reset state so the hearing's discussion doesn't bleed in.
                 if !previous_nl.is_empty() && !previous_fr.is_empty() {
-                    if let Some(q) = flush(
+                    if let Some(q) = flush_question(
                         question_id,
                         &previous_nl,
                         &previous_fr,
@@ -628,7 +632,7 @@ fn extract_questions(
 
             if is_group_start || is_single {
                 if !previous_nl.is_empty() && !previous_fr.is_empty() {
-                    if let Some(q) = flush(
+                    if let Some(q) = flush_question(
                         question_id,
                         &previous_nl,
                         &previous_fr,
@@ -676,7 +680,7 @@ fn extract_questions(
 
     // Flush the last question.
     if !previous_nl.is_empty() && !previous_fr.is_empty() {
-        if let Some(q) = flush(
+        if let Some(q) = flush_question(
             question_id,
             &previous_nl,
             &previous_fr,
@@ -1022,71 +1026,4 @@ fn extract_commission_from_document(document: &Html) -> Result<String, Box<dyn E
         .join(" ");
 
     Ok(parse_commission_type(&raw).to_string())
-}
-
-fn merge_duplicate_questions(questions: &mut Vec<ScrapedQuestion>) {
-    let mut merged: Vec<ScrapedQuestion> = Vec::with_capacity(questions.len());
-
-    for question in questions.drain(..) {
-        let duplicate_idx = merged.iter().position(|existing| {
-            existing.session_id == question.session_id
-                && existing.meeting_id == question.meeting_id
-                && existing.date == question.date
-                && existing.internal_ids == question.internal_ids
-                && existing.questioners == question.questioners
-                && existing.questionees == question.questionees
-                && existing.topics_nl == question.topics_nl
-                && existing.topics_fr == question.topics_fr
-        });
-
-        if let Some(idx) = duplicate_idx {
-            let existing = &mut merged[idx];
-
-            eprintln!(
-                "[meetings-commission] WARNING: merging duplicate question {} into question {} \
-                 (meeting {}, internal_ids={})",
-                question.question_id,
-                existing.question_id,
-                question.meeting_id,
-                question.internal_ids
-            );
-
-            existing.respondents = merge_csv_values(&existing.respondents, &question.respondents);
-
-            existing.discussion = merge_discussion_json(&existing.discussion, &question.discussion);
-        } else {
-            merged.push(question);
-        }
-    }
-
-    *questions = merged;
-
-    // Re-number question IDs after merging.
-    for (idx, question) in questions.iter_mut().enumerate() {
-        question.question_id = idx as i32;
-    }
-}
-
-fn merge_csv_values(left: &str, right: &str) -> String {
-    let mut values = Vec::new();
-
-    for value in left.split(',').chain(right.split(',')) {
-        let value = value.trim();
-
-        if !value.is_empty() && !values.iter().any(|v| v == value) {
-            values.push(value.to_string());
-        }
-    }
-
-    values.join(",")
-}
-
-fn merge_discussion_json(left: &str, right: &str) -> String {
-    let mut left_value: Vec<serde_json::Value> = serde_json::from_str(left).unwrap_or_default();
-
-    let right_value: Vec<serde_json::Value> = serde_json::from_str(right).unwrap_or_default();
-
-    left_value.extend(right_value);
-
-    serde_json::to_string_pretty(&left_value).unwrap_or_else(|_| left.to_string())
 }
