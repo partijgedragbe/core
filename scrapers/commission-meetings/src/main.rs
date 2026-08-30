@@ -504,6 +504,13 @@ async fn scrape_meeting(
     })
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SectionLang {
+    Nl,
+    Fr,
+}
+
+/// Extracts questions from the document.
 fn extract_questions(
     document: &Html,
     session_id: u32,
@@ -516,9 +523,32 @@ fn extract_questions(
     let mut previous_discussion = String::new();
     let mut question_id: i32 = 0;
 
-    // Commission reports always contain questions from the start; no section header needed.
-    let french_indicators = ["questions jointes", "question de"];
-    let dutch_indicators = ["samengevoegde vragen", "toegevoegde vragen", "vraag van"];
+    // Start with Dutch
+    let mut current_lang = SectionLang::Nl;
+
+    // Indicator words to know if we are in the Dutch or French section of the question titles
+    let french_indicators = [
+        "questions jointes",
+        "qestions jointes", // FIX: Typo in IC56188
+        "question",
+        "questions et interpellation jointes",
+        "questions et interpellations jointes",
+        "interpellation et question jointes",
+        "interpellations et question jointes",
+        "interpellation et questions jointes",
+        "interpellations et questions jointes",
+    ];
+    let dutch_indicators = [
+        "samengevoegde vragen",
+        "toegevoegde vragen",
+        "vraag",
+        "samengevoegde vragen en interpellatie",
+        "toegevoegde vragen en interpellaties",
+        "interpellatie en vraag",
+        "interpellaties en vraag",
+        "interpellatie en vragen",
+        "interpellaties en vragen",
+    ];
 
     let flush_question = |id: i32,
                           nl: &str,
@@ -549,57 +579,22 @@ fn extract_questions(
         let tag = element.value().name();
 
         if tag == "h2" {
-            let mut found_nl: Option<String> = None;
-            let mut found_fr: Option<String> = None;
+            let raw = clean_text(&element.text().collect::<Vec<_>>().join(" ")).replace('"', "'");
+            let text = handle_one_off_issues(raw);
+            if text.trim().is_empty() {
+                continue;
+            }
+            let lower = text.to_lowercase();
 
-            // Dutch spans: swap to FR if they look French.
-            if let Some(span) = element
-                .select(selector_span())
-                .filter(|s| matches!(s.value().attr("lang"), Some("NL") | Some("NL-BE")))
-                .last()
-            {
-                let text =
-                    clean_text(&span.text().collect::<Vec<_>>().join(" ")).replace("\"", "'");
-                let text = handle_one_off_issues(text);
-                if french_indicators
-                    .iter()
-                    .any(|w| text.to_lowercase().contains(w))
-                {
-                    found_fr = Some(text);
-                } else {
-                    found_nl = Some(text);
-                }
+            // Set the language based on the indicator words in the <h2> text.
+            if french_indicators.iter().any(|w| lower.contains(w)) {
+                current_lang = SectionLang::Fr;
+            } else if dutch_indicators.iter().any(|w| lower.contains(w)) {
+                current_lang = SectionLang::Nl;
             }
 
-            // French spans: swap to NL if they look Dutch.
-            if let Some(span) = element
-                .select(selector_span())
-                .filter(|s| s.value().attr("lang") == Some("FR"))
-                .last()
-            {
-                let text =
-                    clean_text(&span.text().collect::<Vec<_>>().join(" ")).replace("\"", "'");
-                let text = handle_one_off_issues(text);
-                if dutch_indicators
-                    .iter()
-                    .any(|w| text.to_lowercase().contains(w))
-                {
-                    found_nl = Some(text);
-                } else {
-                    found_fr = Some(text);
-                }
-            }
-
-            let is_hearing = found_nl
-                .as_deref()
-                .map_or(false, |t| t.to_lowercase().contains("hoorzitting"))
-                || found_fr
-                    .as_deref()
-                    .map_or(false, |t| t.to_lowercase().contains("audition"));
-
+            let is_hearing = lower.contains("hoorzitting") || lower.contains("audition");
             if is_hearing {
-                // Flush any pending question that came before this hearing,
-                // then reset state so the hearing's discussion doesn't bleed in.
                 if !previous_nl.is_empty() && !previous_fr.is_empty() {
                     if let Some(q) = flush_question(
                         question_id,
@@ -617,18 +612,11 @@ fn extract_questions(
                 continue;
             }
 
-            // NOTE: ic017x.html uses "toegevoegde vragen" instead of "Samengevoegde" for grouped questions.
-            let is_group_start = found_nl.as_deref().map_or(false, |t| {
-                t.starts_with("Samengevoegde") || t.contains("toegevoegde vragen")
-            }) || found_fr.as_deref().map_or(false, |t| t.contains("jointes"));
-            let is_subquestion = found_nl.as_deref().map_or(false, |t| t.starts_with("-"))
-                || found_fr.as_deref().map_or(false, |t| t.starts_with("-"));
-            let is_single = found_nl
-                .as_deref()
-                .map_or(false, |t| t.starts_with("Vraag van"))
-                || found_fr
-                    .as_deref()
-                    .map_or(false, |t| t.starts_with("Question de"));
+            let is_group_start = text.starts_with("Samengevoegde")
+                || text.contains("toegevoegde vragen")
+                || text.contains("jointes");
+            let is_subquestion = text.starts_with('-');
+            let is_single = text.starts_with("Vraag van") || text.starts_with("Question de");
 
             if is_group_start || is_single {
                 if !previous_nl.is_empty() && !previous_fr.is_empty() {
@@ -645,20 +633,20 @@ fn extract_questions(
                     previous_nl.clear();
                     previous_fr.clear();
                 }
-                if let Some(t) = found_nl {
-                    previous_nl = t;
-                }
-                if let Some(t) = found_fr {
-                    previous_fr = t;
+                match current_lang {
+                    SectionLang::Nl => previous_nl = text,
+                    SectionLang::Fr => previous_fr = text,
                 }
             } else if is_subquestion {
-                if let Some(t) = found_nl {
-                    previous_nl.push('\n');
-                    previous_nl.push_str(&t);
-                }
-                if let Some(t) = found_fr {
-                    previous_fr.push('\n');
-                    previous_fr.push_str(&t);
+                match current_lang {
+                    SectionLang::Nl => {
+                        previous_nl.push('\n');
+                        previous_nl.push_str(&text);
+                    }
+                    SectionLang::Fr => {
+                        previous_fr.push('\n');
+                        previous_fr.push_str(&text);
+                    }
                 }
             }
         }
@@ -695,21 +683,21 @@ fn extract_questions(
 
 /// Handle one-off mistakes from the commission meeting reports.
 fn handle_one_off_issues(text: String) -> String {
-    // Meeting C165: question 12 has '-Kjell Vander Elst' instead of '- Kjell Vander Elst' so a missing space, handle it here
+    // IC56165: question 12 has '-Kjell Vander Elst' instead of '- Kjell Vander Elst' so a missing space, handle it here
     let text = {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| Regex::new(r"^-(\S)").unwrap());
         re.replace(&text, "- $1").into_owned()
     };
 
-    // Meeting C129: question 2 contains an additional 'Vraag van Xavier Dubois' instead of just 'Xavier Dubois', handle it here
+    // IC56129: question 2 contains an additional 'Vraag van Xavier Dubois' instead of just 'Xavier Dubois', handle it here
     let text = if let Some(rest) = text.strip_prefix("- Vraag van ") {
         format!("- {}", rest)
     } else {
         text
     };
 
-    // Meeting C393: contains 'Isabelle Hansez Je vous remercie beaucoup', with missing colon
+    // IC56393: contains 'Isabelle Hansez Je vous remercie beaucoup', with missing colon
     let text = {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE
@@ -717,14 +705,14 @@ fn handle_one_off_issues(text: String) -> String {
         re.replace(&text, "$1: $2").into_owned()
     };
 
-    // Meeting 188: contains 'Stefaan Van Hecke (Ecolo-Groen:' without closing round bracket
+    // IC56188: contains 'Stefaan Van Hecke (Ecolo-Groen:' without closing round bracket
     let text = {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| Regex::new(r"(\([^():\n]*?):\s").unwrap());
         re.replace(&text, "$1): ").into_owned()
     };
 
-    // Meeting 161: contains 'Minister Jan Jambon Ik denk dat het zo in de budgettaire tabel staat. Ik zou het moeten nakijken.' with missing colon
+    // IC56161: contains 'Minister Jan Jambon Ik denk dat het zo in de budgettaire tabel staat. Ik zou het moeten nakijken.' with missing colon
     let text = {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
@@ -732,6 +720,10 @@ fn handle_one_off_issues(text: String) -> String {
         });
         re.replace(&text, "$1: $2").into_owned()
     };
+
+    // IC5656430: contains 'Matti Vandael' which should be 'Matti Vandemaele'
+    // (typo in the source report; his correct name is Matti Vandemaele).
+    let text = text.replace("Matti Vandael", "Matti Vandemaele");
 
     text
 }
@@ -746,6 +738,14 @@ fn extract_question_data(
     let mut internal_ids = Vec::new();
 
     for capture in question_regex().captures_iter(question_text) {
+        let dossier_id = format!("Q{}", capture[4].trim());
+
+        // FIX: IC56209 Q16 contains an exact copy-pasted subquestion.
+        // --> Treat as the same question rather than a distinct one
+        if internal_ids.contains(&dossier_id) {
+            continue;
+        }
+
         let questioner = capture[1]
             .trim()
             .replace("- ", "")
@@ -757,7 +757,6 @@ fn extract_question_data(
             .map(|m| m.as_str().trim().to_string())
             .unwrap_or_else(|| "Onbekend".to_string());
         let topic = capture[3].trim().to_string();
-        let dossier_id = format!("Q{}", capture[4].trim());
 
         questioners.push(questioner);
         if !questionees.contains(&questionee) {
