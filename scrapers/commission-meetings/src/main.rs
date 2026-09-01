@@ -8,7 +8,7 @@ use http::StatusCode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parquet::arrow::ArrowWriter;
 use regex::Regex;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde_json::json;
 use std::error::Error;
 use std::fmt;
@@ -487,7 +487,8 @@ async fn scrape_meeting(
     let chair = extract_chair_from_document(&document)?;
     let commission = extract_commission_from_document(&document)?;
 
-    let questions = extract_questions(&document, session_id, meeting_id, &date)?;
+    let mut questions = extract_questions(&document, session_id, meeting_id, &date)?;
+    fix_ic56349_duplicate_question(session_id, meeting_id, &mut questions);
 
     Ok(MeetingOutput {
         meeting: ScrapedMeeting {
@@ -510,23 +511,33 @@ enum SectionLang {
     Fr,
 }
 
-/// Extracts questions from the document.
-fn extract_questions(
-    document: &Html,
-    session_id: u32,
-    meeting_id: u32,
-    date: &str,
-) -> Result<Vec<ScrapedQuestion>, Box<dyn Error>> {
-    let mut questions = Vec::new();
-    let mut previous_nl = String::new();
-    let mut previous_fr = String::new();
-    let mut previous_discussion = String::new();
-    let mut question_id: i32 = 0;
+/// True if a span's text is nothing but the ToC entry number badge (e.g. "13", "14").
+/// Content is routinely split across several same-lang spans, so we can't rely on
+/// position (first/last) to separate the badge from real content — only the fact
+/// that the badge span's text is pure digits.
+fn is_toc_number_badge(text: &str) -> bool {
+    let t = text.replace('\u{00A0}', "");
+    let t = t.trim();
+    !t.is_empty() && t.chars().all(|c| c.is_ascii_digit())
+}
 
-    // Start with Dutch
-    let mut current_lang = SectionLang::Nl;
+/// Join all non-badge spans of the given lang(s) into one string, in document order.
+fn join_lang_spans(element: &ElementRef, langs: &[&str]) -> Option<String> {
+    let parts: Vec<String> = element
+        .select(selector_span())
+        .filter(|s| s.value().attr("lang").map_or(false, |l| langs.contains(&l)))
+        .map(|s| clean_text(&s.text().collect::<Vec<_>>().join(" ")))
+        .filter(|t| !is_toc_number_badge(t))
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(clean_text(&parts.join(" ")))
+    }
+}
 
-    // Indicator words to know if we are in the Dutch or French section of the question titles
+/// Extract NL/FR heading text, swapping where the source mislabels lang.
+fn extract_bilingual_spans(element: &ElementRef) -> (Option<String>, Option<String>) {
     let french_indicators = [
         "questions jointes",
         "qestions jointes", // FIX: Typo in IC56188
@@ -549,6 +560,37 @@ fn extract_questions(
         "interpellatie en vragen",
         "interpellaties en vragen",
     ];
+    let mut nl = join_lang_spans(element, &["NL", "NL-BE"]);
+    let mut fr = join_lang_spans(element, &["FR", "FR-BE"]);
+
+    if let Some(t) = &nl {
+        if french_indicators
+            .iter()
+            .any(|w| t.to_lowercase().contains(w))
+        {
+            fr = nl.take();
+        }
+    }
+    if let Some(t) = &fr {
+        let lower = t.to_lowercase();
+        if lower.contains(" aan ") || dutch_indicators.iter().any(|w| lower.contains(w)) {
+            nl = fr.take();
+        }
+    }
+    (nl, fr)
+}
+
+fn extract_questions(
+    document: &Html,
+    session_id: u32,
+    meeting_id: u32,
+    date: &str,
+) -> Result<Vec<ScrapedQuestion>, Box<dyn Error>> {
+    let mut questions = Vec::new();
+    let mut previous_nl = String::new();
+    let mut previous_fr = String::new();
+    let mut previous_discussion = String::new();
+    let mut question_id: i32 = 0;
 
     let flush_question = |id: i32,
                           nl: &str,
@@ -579,78 +621,70 @@ fn extract_questions(
         let tag = element.value().name();
 
         if tag == "h2" {
-            let raw = clean_text(&element.text().collect::<Vec<_>>().join(" ")).replace('"', "'");
-            let text = handle_one_off_issues(raw);
-            if text.trim().is_empty() {
-                continue;
-            }
-            let lower = text.to_lowercase();
-
-            // Set the language based on the indicator words in the <h2> text.
-            if french_indicators.iter().any(|w| lower.contains(w)) {
-                current_lang = SectionLang::Fr;
-            } else if dutch_indicators.iter().any(|w| lower.contains(w)) {
-                current_lang = SectionLang::Nl;
-            }
-
-            let is_hearing = lower.contains("hoorzitting") || lower.contains("audition");
-            if is_hearing {
-                if !previous_nl.is_empty() && !previous_fr.is_empty() {
-                    if let Some(q) = flush_question(
-                        question_id,
-                        &previous_nl,
-                        &previous_fr,
-                        &previous_discussion,
-                    )? {
-                        questions.push(q);
-                        question_id += 1;
-                    }
+            let (nl_text, fr_text) = extract_bilingual_spans(&element);
+            for (text, lang) in [(nl_text, SectionLang::Nl), (fr_text, SectionLang::Fr)] {
+                let Some(text) = text else { continue };
+                let text = handle_one_off_issues(text.replace('"', "'"), session_id, meeting_id);
+                if text.trim().is_empty() {
+                    continue;
                 }
-                previous_nl.clear();
-                previous_fr.clear();
-                previous_discussion.clear();
-                continue;
-            }
-
-            let is_group_start = text.starts_with("Samengevoegde")
-                || text.contains("toegevoegde vragen")
-                || text.contains("jointes");
-            let is_subquestion = text.starts_with('-');
-            let is_single = text.starts_with("Vraag van") || text.starts_with("Question de");
-
-            if is_group_start || is_single {
-                if !previous_nl.is_empty() && !previous_fr.is_empty() {
-                    if let Some(q) = flush_question(
-                        question_id,
-                        &previous_nl,
-                        &previous_fr,
-                        &previous_discussion,
-                    )? {
-                        questions.push(q);
-                        question_id += 1;
+                let lower = text.to_lowercase();
+                let is_hearing = lower.contains("hoorzitting") || lower.contains("audition");
+                if is_hearing {
+                    if !previous_nl.is_empty() && !previous_fr.is_empty() {
+                        if let Some(q) = flush_question(
+                            question_id,
+                            &previous_nl,
+                            &previous_fr,
+                            &previous_discussion,
+                        )? {
+                            questions.push(q);
+                            question_id += 1;
+                        }
                     }
-                    previous_discussion.clear();
                     previous_nl.clear();
                     previous_fr.clear();
+                    previous_discussion.clear();
+                    continue;
                 }
-                match current_lang {
-                    SectionLang::Nl => previous_nl = text,
-                    SectionLang::Fr => previous_fr = text,
-                }
-            } else if is_subquestion {
-                match current_lang {
-                    SectionLang::Nl => {
-                        previous_nl.push('\n');
-                        previous_nl.push_str(&text);
+                let is_group_start = text.starts_with("Samengevoegde")
+                    || text.contains("toegevoegde vragen")
+                    || text.contains("jointes");
+                let is_subquestion = text.starts_with('-');
+                let is_single = text.starts_with("Vraag van") || text.starts_with("Question de");
+                if is_group_start || is_single {
+                    if !previous_nl.is_empty() && !previous_fr.is_empty() {
+                        if let Some(q) = flush_question(
+                            question_id,
+                            &previous_nl,
+                            &previous_fr,
+                            &previous_discussion,
+                        )? {
+                            questions.push(q);
+                            question_id += 1;
+                        }
+                        previous_discussion.clear();
+                        previous_nl.clear();
+                        previous_fr.clear();
                     }
-                    SectionLang::Fr => {
-                        previous_fr.push('\n');
-                        previous_fr.push_str(&text);
+                    match lang {
+                        SectionLang::Nl => previous_nl = text,
+                        SectionLang::Fr => previous_fr = text,
+                    }
+                } else if is_subquestion {
+                    match lang {
+                        SectionLang::Nl => {
+                            previous_nl.push('\n');
+                            previous_nl.push_str(&text);
+                        }
+                        SectionLang::Fr => {
+                            previous_fr.push('\n');
+                            previous_fr.push_str(&text);
+                        }
                     }
                 }
             }
         }
-
         if tag == "p" {
             let text = element
                 .text()
@@ -659,14 +693,12 @@ fn extract_questions(
                 .trim()
                 .to_string();
             if !text.is_empty() {
-                let text = handle_one_off_issues(text);
+                let text = handle_one_off_issues(text, session_id, meeting_id);
                 previous_discussion.push_str(&clean_text(&text));
                 previous_discussion.push_str("NEWPARAGRAPH");
             }
         }
     }
-
-    // Flush the last question.
     if !previous_nl.is_empty() && !previous_fr.is_empty() {
         if let Some(q) = flush_question(
             question_id,
@@ -677,53 +709,85 @@ fn extract_questions(
             questions.push(q);
         }
     }
-
     Ok(questions)
 }
 
 /// Handle one-off mistakes from the commission meeting reports.
-fn handle_one_off_issues(text: String) -> String {
-    // IC56165: question 12 has '-Kjell Vander Elst' instead of '- Kjell Vander Elst' so a missing space, handle it here
-    let text = {
+fn handle_one_off_issues(text: String, session_id: u32, meeting_id: u32) -> String {
+    let mut text = text;
+
+    // IC5647: has "Vincent van Quickenborne" instead of "Vincent Van Quickenborne".
+    if session_id == 56 && meeting_id == 47 {
+        text = text.replace("Vincent van Quickenborne", "Vincent Van Quickenborne");
+    }
+
+    // IC56094: question has '-Marie Meunier' instead of '- Marie Meunier' so a missing space, handle it here
+    if session_id == 56 && meeting_id == 94 {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| Regex::new(r"^-(\S)").unwrap());
-        re.replace(&text, "- $1").into_owned()
-    };
+        text = re.replace(&text, "- $1").into_owned();
+    }
+
+    // IC56107: question has incorrect ID 6003263c, should be 56003263C
+    if session_id == 56 && meeting_id == 107 {
+        text = text.replace("6003263c", "56003263C");
+    }
 
     // IC56129: question 2 contains an additional 'Vraag van Xavier Dubois' instead of just 'Xavier Dubois', handle it here
-    let text = if let Some(rest) = text.strip_prefix("- Vraag van ") {
-        format!("- {}", rest)
-    } else {
-        text
-    };
-
-    // IC56393: contains 'Isabelle Hansez Je vous remercie beaucoup', with missing colon
-    let text = {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE
-            .get_or_init(|| Regex::new(r"^(\d{2}\.\d{2}\s+Isabelle\s+Hansez)\s+([A-Z])").unwrap());
-        re.replace(&text, "$1: $2").into_owned()
-    };
-
-    // IC56188: contains 'Stefaan Van Hecke (Ecolo-Groen:' without closing round bracket
-    let text = {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"(\([^():\n]*?):\s").unwrap());
-        re.replace(&text, "$1): ").into_owned()
-    };
+    if session_id == 56 && meeting_id == 129 {
+        if let Some(rest) = text.strip_prefix("-Vraag van ") {
+            text = format!("- {}", rest);
+        }
+    }
 
     // IC56161: contains 'Minister Jan Jambon Ik denk dat het zo in de budgettaire tabel staat. Ik zou het moeten nakijken.' with missing colon
-    let text = {
+    if session_id == 56 && meeting_id == 161 {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
             Regex::new(r"^(\d{2}\.\d{2}\s+Minister\s+Jan\s+Jambon)\s+([A-ZÀ-Ý])").unwrap()
         });
-        re.replace(&text, "$1: $2").into_owned()
-    };
+        text = re.replace(&text, "$1: $2").into_owned();
+    }
 
-    // IC5656430: contains 'Matti Vandael' which should be 'Matti Vandemaele'
+    // IC56165: question 12 has '-Kjell Vander Elst' instead of '- Kjell Vander Elst' so a missing space, handle it here
+    if session_id == 56 && meeting_id == 165 {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"^-(\S)").unwrap());
+        text = re.replace(&text, "- $1").into_owned();
+    }
+
+    // IC56188: contains 'Stefaan Van Hecke (Ecolo-Groen:' without closing round bracket
+    if session_id == 56 && meeting_id == 188 {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"(\([^():\n]*?):\s").unwrap());
+        text = re.replace(&text, "$1): ").into_owned();
+    }
+
+    // IC56357: question has incorrect ID 6015432C, should be 56015432C
+    if session_id == 56 && meeting_id == 357 {
+        text = text.replace("6015432C", "56015432C");
+    }
+
+    // IC56094: question has '-Natalie Eggermont' instead of '- Natalie Eggermont' so a missing space, handle it here
+    if session_id == 56 && meeting_id == 366 {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"^-(\S)").unwrap());
+        text = re.replace(&text, "- $1").into_owned();
+    }
+
+    // IC56393: contains 'Isabelle Hansez Je vous remercie beaucoup', with missing colon
+    if session_id == 56 && meeting_id == 393 {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE
+            .get_or_init(|| Regex::new(r"^(\d{2}\.\d{2}\s+Isabelle\s+Hansez)\s+([A-Z])").unwrap());
+        text = re.replace(&text, "$1: $2").into_owned();
+    }
+
+    // IC56430: contains 'Matti Vandael' which should be 'Matti Vandemaele'
     // (typo in the source report; his correct name is Matti Vandemaele).
-    let text = text.replace("Matti Vandael", "Matti Vandemaele");
+    if session_id == 56 && meeting_id == 430 {
+        text = text.replace("Matti Vandael", "Matti Vandemaele");
+    }
 
     text
 }
@@ -1025,4 +1089,25 @@ fn extract_commission_from_document(document: &Html) -> Result<String, Box<dyn E
         .join(" ");
 
     Ok(parse_commission_type(&raw).to_string())
+}
+
+/// IC56349: question 04 (Metsu / De Smet / Ribaudo, re: victims of the Zaventem/Maalbeek
+/// attacks and the terror victims' guarantee fund) has its header block repeated twice in
+/// the source HTML. The first occurrence gets flushed with the wrong discussion text (by Sam Van Rooy); the
+/// second occurrence (right after) has the correct one. Discard the first entry.
+fn fix_ic56349_duplicate_question(
+    session_id: u32,
+    meeting_id: u32,
+    questions: &mut Vec<ScrapedQuestion>,
+) {
+    if session_id != 56 || meeting_id != 349 {
+        return;
+    }
+    const DOSSIER_IDS: &str = "Q56014194C,Q56014650C,Q56015108C";
+    if let Some(first_idx) = questions.iter().position(|q| q.internal_ids == DOSSIER_IDS) {
+        questions.remove(first_idx);
+        for (new_id, q) in questions.iter_mut().enumerate() {
+            q.question_id = new_id as i32;
+        }
+    }
 }
