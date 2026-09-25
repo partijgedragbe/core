@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,6 +57,11 @@ const MAX_BACKOFF_MS: u64 = 60_000;
 const SAVE_EVERY: usize = 5;
 const MODEL_ADOPTED_TEXT: &str = "mistral-large-latest";
 const MODEL_REPORT: &str = "mistral-large-latest";
+
+const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODEL: &str = "openrouter/free";
+
 const SEO_TITLE_MIN: usize = 40;
 const SEO_TITLE_MAX: usize = 60;
 const SEO_DESCRIPTION_MIN: usize = 120;
@@ -248,8 +253,53 @@ fn strip_code_fences(raw: &str) -> String {
     }
 }
 
+/// Escape raw control characters (e.g. literal newlines) that appear inside
+/// JSON string literals. Some LLMs emit real \n / \t bytes instead of the
+/// escaped \\n / \\t sequences JSON requires, which breaks serde_json.
+/// This walks the raw text tracking string-context and backslash-escapes,
+/// leaving already-valid escape sequences untouched.
+fn sanitize_json_control_chars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for c in raw.chars() {
+        if in_string {
+            if escaped {
+                // Part of an existing valid escape sequence (\\n, \\", \\uXXXX, ...) — pass through.
+                out.push(c);
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    escaped = true;
+                }
+                '"' => {
+                    out.push(c);
+                    in_string = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+            if c == '"' {
+                in_string = true;
+            }
+        }
+    }
+    out
+}
+
 fn parse_adopted_text_summary_response(raw: &str) -> AdoptedTextSummaryJson {
-    let json_str = strip_code_fences(raw);
+    let json_str = sanitize_json_control_chars(&strip_code_fences(raw));
     serde_json::from_str(&json_str).unwrap_or_else(|e| {
         eprintln!("[summarizer] WARNING: failed to parse content JSON: {e}\nRaw:\n{raw}");
         AdoptedTextSummaryJson::default()
@@ -257,7 +307,7 @@ fn parse_adopted_text_summary_response(raw: &str) -> AdoptedTextSummaryJson {
 }
 
 fn parse_report_summary_response(raw: &str) -> ReportSummaryJson {
-    let json_str = strip_code_fences(raw);
+    let json_str = sanitize_json_control_chars(&strip_code_fences(raw));
     serde_json::from_str(&json_str).unwrap_or_else(|e| {
         eprintln!("[summarizer] WARNING: failed to parse arguments JSON: {e}\nRaw:\n{raw}");
         ReportSummaryJson::default()
@@ -494,10 +544,76 @@ fn col_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
 }
 
-/// Call Mistral API
-async fn mistral_complete(
+/// Calls the OpenRouter API to complete a chat request.
+async fn openrouter_complete(
     client: &Client,
     api_key: &str,
+    system: &str,
+    user: &str,
+    call_count: &mut u32,
+    rate_limiter: &RateLimiter,
+) -> Option<String> {
+    let payload = json!({
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user",   "content": user }
+        ]
+    });
+
+    rate_limiter.acquire().await;
+
+    let response = client
+        .post(OPENROUTER_URL)
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "application/json")
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .json(&payload)
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => match resp.json::<ApiResponse>().await {
+            Ok(json_resp) => {
+                *call_count += 1;
+                let content = json_resp
+                    .choices
+                    .first()
+                    .map(|c| c.message.content.trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                if content.is_none() {
+                    eprintln!("[openrouter] successful response but no usable content returned");
+                }
+
+                content
+            }
+            Err(err) => {
+                eprintln!("[openrouter] failed to parse response JSON: {err}");
+                None
+            }
+        },
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+
+            eprintln!("[openrouter] failed {status}: {body}");
+            None
+        }
+        Err(err) => {
+            eprintln!("[openrouter] network error: {err}");
+            None
+        }
+    }
+}
+
+/// Calls the Mistral API to complete a chat request.
+/// Retries transient failures, then falls back to OpenRouter.
+/// Non-retryable Mistral failures (including 403) fall back immediately.
+async fn mistral_complete(
+    client: &Client,
+    mistral_api_key: &str,
+    openrouter_api_key: &str,
     system: &str,
     user: &str,
     model: &str,
@@ -511,27 +627,55 @@ async fn mistral_complete(
             { "role": "user",   "content": user }
         ]
     });
+
     let mut attempt = 0u32;
     let mut backoff_ms = INITIAL_BACKOFF_MS;
+
     loop {
         attempt += 1;
+
         rate_limiter.acquire().await;
+
         let response = client
-            .post("https://api.mistral.ai/v1/chat/completions")
+            .post(MISTRAL_URL)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("Bearer {api_key}"))
+            .header(AUTHORIZATION, format!("Bearer {mistral_api_key}"))
             .json(&payload)
             .send()
             .await;
+
         match response {
             Ok(resp) if resp.status().is_success() => {
-                let json_resp: ApiResponse = resp.json().await.unwrap();
-                *call_count += 1;
-                return Some(json_resp.choices[0].message.content.trim().to_string());
+                match resp.json::<ApiResponse>().await {
+                    Ok(json_resp) => {
+                        *call_count += 1;
+
+                        let content = json_resp
+                            .choices
+                            .first()
+                            .map(|choice| choice.message.content.trim().to_string())
+                            .filter(|content| !content.is_empty());
+
+                        if content.is_none() {
+                            eprintln!("[mistral] successful response contained no usable content");
+                        }
+
+                        return content;
+                    }
+
+                    Err(err) => {
+                        eprintln!("[mistral] failed to parse successful response JSON: {err}");
+
+                        // Parsing failure means Mistral didn't give us
+                        // something usable, so fall back to OpenRouter.
+                        break;
+                    }
+                }
             }
             Ok(resp) if resp.status().as_u16() == 429 || resp.status().is_server_error() => {
                 let status = resp.status();
+
                 let retry_after_ms = resp
                     .headers()
                     .get("retry-after")
@@ -539,38 +683,68 @@ async fn mistral_complete(
                     .and_then(|s| s.parse::<u64>().ok())
                     .map(|secs| secs * 1_000 + 500)
                     .unwrap_or(backoff_ms);
+
                 let body = resp.text().await.unwrap_or_default();
+
                 if attempt >= MAX_RETRIES {
-                    eprintln!("Mistral retry failed after {attempt} attempts ({status}): {body}");
-                    return None;
+                    eprintln!(
+                        "[mistral] retry limit reached after {attempt} attempts \
+                         ({status}). Falling back to OpenRouter..."
+                    );
+                    break;
                 }
+
                 eprintln!(
-                    "Mistral {status} (attempt {attempt}/{MAX_RETRIES}), retrying in {retry_after_ms}ms… | {body}"
+                    "[mistral] {status} \
+                     (attempt {attempt}/{MAX_RETRIES}), \
+                     retrying in {retry_after_ms}ms… | {body}"
                 );
+
                 rate_limiter.penalize(retry_after_ms).await;
+
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
             }
+
             Ok(resp) => {
-                eprintln!(
-                    "Mistral failed {}: {}",
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                );
-                return None;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                eprintln!("[mistral] non-retryable failure {status}: {body}");
+                break;
             }
+
             Err(err) => {
                 if attempt >= MAX_RETRIES {
-                    eprintln!("Network error after {attempt} attempts: {err}");
-                    return None;
+                    eprintln!(
+                        "[mistral] network error after {attempt} attempts: {err}. \
+                         Falling back to OpenRouter..."
+                    );
+                    break;
                 }
+
                 eprintln!(
-                    "Network error (attempt {attempt}/{MAX_RETRIES}): {err}, retrying in {backoff_ms}ms…"
+                    "[mistral] network error \
+                     (attempt {attempt}/{MAX_RETRIES}): {err}, \
+                     retrying in {backoff_ms}ms…"
                 );
+
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
             }
         }
     }
+
+    eprintln!("[summarizer] Mistral unavailable, falling back to OpenRouter ({OPENROUTER_MODEL})");
+
+    openrouter_complete(
+        client,
+        openrouter_api_key,
+        system,
+        user,
+        call_count,
+        rate_limiter,
+    )
+    .await
 }
 
 fn hash_text(input: &str) -> String {
@@ -604,9 +778,14 @@ async fn main() {
     // Load environment variables
     dotenvy::dotenv().ok();
     let mistral_api_key = std::env::var("MISTRAL_API_TOKEN").expect("Missing MISTRAL_API_TOKEN");
+    let openrouter_api_key =
+        std::env::var("OPENROUTER_API_KEY").expect("Missing OPENROUTER_API_KEY");
 
     // Optional: pass a single dossier ID as a CLI argument for testing.
-    let single_dossier: Option<String> = Some(String::from("1164")); //std::env::args().nth(1);
+    // Dossier IDs to force-regenerate (bypasses the cache/hash check for these).
+    // Leave empty (HashSet::new()) to respect caches as normal.
+    let force_regen_ids: HashSet<String> = ["987"].iter().map(|s| s.to_string()).collect();
+    let single_dossier: Option<String> = Some(String::from("987")); //std::env::args().nth(1);
     let client = Client::new();
     let dossiers_base = cache_dir().join("sessions/56/dossiers/pdfs");
     let content_out = data_dir().join("summaries/dossier_content.parquet");
@@ -646,6 +825,7 @@ async fn main() {
 
     for dossier_id in &dossier_ids {
         let dossier_dir = dossiers_base.join(dossier_id);
+        let force_this = force_regen_ids.contains(dossier_id);
 
         // Summarize adopted text or original text.
         // If a dossier was adopted, the adopted text is often just a line-by-line
@@ -699,10 +879,11 @@ async fn main() {
                 );
             } else {
                 let hash = hash_text(&content);
-                let needs_regen = match content_cache.get(&hash) {
-                    Some(existing) => !existing.is_complete(),
-                    None => true,
-                };
+                let needs_regen = force_this
+                    || match content_cache.get(&hash) {
+                        Some(existing) => !existing.is_complete(),
+                        None => true,
+                    };
                 if needs_regen {
                     pb.set_message(format!(
                         "api_calls={total_calls} — summarizing {} for dossier {dossier_id}",
@@ -718,6 +899,7 @@ async fn main() {
                     if let Some(raw_response) = mistral_complete(
                         &client,
                         &mistral_api_key,
+                        &openrouter_api_key,
                         system_prompt_content(),
                         &user,
                         MODEL_ADOPTED_TEXT,
@@ -768,7 +950,7 @@ async fn main() {
                 );
             } else if !trimmed_content.is_empty() {
                 let hash = hash_text(&content);
-                if !arguments_cache.contains_key(&hash) {
+                if force_this || !arguments_cache.contains_key(&hash) {
                     pb.set_message(format!(
                         "api_calls={total_calls} — summarizing report for dossier {dossier_id}"
                     ));
@@ -776,6 +958,7 @@ async fn main() {
                     if let Some(raw_response) = mistral_complete(
                         &client,
                         &mistral_api_key,
+                        &openrouter_api_key,
                         system_prompt_arguments(),
                         &user,
                         MODEL_REPORT,
