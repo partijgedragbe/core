@@ -72,10 +72,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         all_commissions.push(ScrapedCommission {
             name: entry.name.clone(),
             ctype: entry.ctype.clone(),
-            chairs: extract_members(&doc, "Voorzitter"),
-            subchairs: extract_members(&doc, "Ondervoorzitter"),
-            permanent_members: extract_members(&doc, "Vaste Leden"),
-            replacement_members: extract_members(&doc, "Plaatsvervangers"),
+            chairs: extract_members(&doc, CommissionRole::Chair),
+            subchairs: extract_members(&doc, CommissionRole::Subchair),
+            permanent_members: extract_members(&doc, CommissionRole::Permanent),
+            replacement_members: extract_members(&doc, CommissionRole::Replacement),
         });
     }
 
@@ -170,20 +170,46 @@ fn extract_index(document: &Html, detail_dir: &Path) -> Vec<CommissionIndex> {
     entries
 }
 
-fn extract_members(doc: &Html, role: &str) -> String {
-    let role = role.to_lowercase();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommissionRole {
+    Chair,
+    Subchair,
+    Permanent,
+    Replacement,
+}
+
+/// Matches the bold role label exactly: a substring match would treat
+/// `Ondervoorzitters:` as `Voorzitter`.
+fn parse_role_label(label: &str) -> Option<CommissionRole> {
+    let normalized: String = label
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    // `Voorzitter(s):` splits into `voorzitter` and `s`.
+    let key = normalized
+        .split_whitespace()
+        .filter(|token| *token != "s")
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    match key.as_str() {
+        "voorzitter" | "voorzitters" => Some(CommissionRole::Chair),
+        "ondervoorzitter" | "ondervoorzitters" => Some(CommissionRole::Subchair),
+        "vaste leden" => Some(CommissionRole::Permanent),
+        "plaatsvervangers" => Some(CommissionRole::Replacement),
+        _ => None,
+    }
+}
+
+fn extract_members(doc: &Html, role: CommissionRole) -> String {
     let mut names = Vec::new();
 
     for p in doc.select(&SEL_P) {
         let Some(first_b) = p.select(&SEL_B).next() else {
             continue;
         };
-        if !first_b
-            .text()
-            .collect::<String>()
-            .to_lowercase()
-            .contains(&role)
-        {
+        if parse_role_label(&first_b.text().collect::<String>()) != Some(role) {
             continue;
         }
         for a in p.select(&SEL_A) {
@@ -195,4 +221,73 @@ fn extract_members(doc: &Html, role: &str) -> String {
     }
 
     names.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Trimmed from the Justitie detail page: one chair, two subchairs.
+    const JUSTITIE_HTML: &str = r#"
+        <div id="story">
+            <h4>JUSTITIE </h4>
+            <p><b>Voorzitter(s):</b>
+                <br><b>Les Engagés:</b>
+                <A HREF="cvview54.cfm?key=08161">Ismaël Nuino</A>
+            </p>
+            <p><b>Ondervoorzitters:</b>
+                <br><b>cd&v:</b>
+                <A HREF="cvview54.cfm?key=07193">Steven Matheï</A>
+                <br><b>N-VA:</b>
+                <A HREF="cvview54.cfm?key=06230">Kristien Van Vaerenbergh</A>
+            </p>
+            <p><b>Vaste Leden:</b>
+                <br><b>N-VA:</b>
+                <A HREF="cvview54.cfm?key=06907">Christoph D'Haese</A>
+            </p>
+            <p><b>Plaatsvervangers:</b>
+                <br><b>VB:</b>
+                <A HREF="cvview54.cfm?key=07888">Werner Somers</A>
+            </p>
+        </div>
+    "#;
+
+    #[test]
+    fn parses_role_labels_exactly() {
+        assert_eq!(
+            parse_role_label("Voorzitter(s):"),
+            Some(CommissionRole::Chair)
+        );
+        assert_eq!(
+            parse_role_label("Ondervoorzitters:"),
+            Some(CommissionRole::Subchair)
+        );
+        assert_eq!(
+            parse_role_label("Vaste Leden:"),
+            Some(CommissionRole::Permanent)
+        );
+        assert_eq!(
+            parse_role_label("Plaatsvervangers:"),
+            Some(CommissionRole::Replacement)
+        );
+        assert_eq!(parse_role_label("Les Engagés:"), None);
+    }
+
+    #[test]
+    fn subchairs_are_not_listed_as_chairs() {
+        let doc = Html::parse_document(JUSTITIE_HTML);
+        assert_eq!(extract_members(&doc, CommissionRole::Chair), "Ismaël Nuino");
+        assert_eq!(
+            extract_members(&doc, CommissionRole::Subchair),
+            "Steven Matheï, Kristien Van Vaerenbergh"
+        );
+        assert_eq!(
+            extract_members(&doc, CommissionRole::Permanent),
+            "Christoph D'Haese"
+        );
+        assert_eq!(
+            extract_members(&doc, CommissionRole::Replacement),
+            "Werner Somers"
+        );
+    }
 }
