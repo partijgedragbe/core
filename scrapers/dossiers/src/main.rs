@@ -204,7 +204,12 @@ impl fmt::Display for DocumentStatus {
 #[derive(Debug, Clone, Copy)]
 enum CalendarEventType {
     InBespreking,
+    Aangenomen,
+    Verworpen,
+    Terugzending,
+    VerwerpingAangenomen,
     StartVergadering,
+    StemmingOverUrgentie,
     ZonderVoorwerp,
     Onbekend,
 }
@@ -1193,8 +1198,18 @@ fn parse_calendar_event_type(raw: &str) -> CalendarEventType {
         CalendarEventType::InBespreking
     } else if raw.contains("start vergadering") {
         CalendarEventType::StartVergadering
+    } else if raw.contains("verworpen") {
+        CalendarEventType::Verworpen
+    } else if raw.contains("verwerping aang.") {
+        CalendarEventType::VerwerpingAangenomen
+    } else if raw.contains("terugzending") {
+        CalendarEventType::Terugzending
+    } else if raw.contains("aangenomen") {
+        CalendarEventType::Aangenomen
     } else if raw.contains("zonder voorwerp") {
         CalendarEventType::ZonderVoorwerp
+    } else if raw.contains("stem. urgentie") {
+        CalendarEventType::StemmingOverUrgentie
     } else {
         CalendarEventType::Onbekend
     }
