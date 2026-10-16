@@ -1,4 +1,4 @@
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use crawl::client::ScrapingClient;
 use crawl::paths::{cache_dir, data_dir};
@@ -70,11 +70,25 @@ fn chair_regex() -> &'static Regex {
         .get_or_init(|| Regex::new(r"(?i)voorgezeten\s+door\s+([^\.]+?)\s*(?:\.|$)").unwrap())
 }
 
+/// A paragraph consisting solely of a question ID, e.g. "56017463C".
+/// In joint written questions these separate the individual questions.
+fn question_id_marker_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\(?(\d{6,8}[A-Za-z])\)?$").unwrap())
+}
+
+/// A paragraph starting with a positional sub-question number, e.g. "1)  Monsieur le Ministre,".
+/// Used by joint written questions that number their parts instead of repeating the question ID.
+fn positional_marker_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)^(\d{1,2})\)\s*(.*)$").unwrap())
+}
+
 /// SELECTORS
 static SELECTOR_SPAN: OnceLock<Selector> = OnceLock::new();
 static SELECTOR_SPAN_P: OnceLock<Selector> = OnceLock::new();
 static SELECTOR_TABLE: OnceLock<Selector> = OnceLock::new();
-static SELECTOR_H2_OR_P: OnceLock<Selector> = OnceLock::new();
+static SELECTOR_H1_OR_H2_OR_P: OnceLock<Selector> = OnceLock::new();
 
 fn selector_span() -> &'static Selector {
     SELECTOR_SPAN.get_or_init(|| Selector::parse("span").unwrap())
@@ -85,8 +99,9 @@ fn selector_span_p() -> &'static Selector {
 fn selector_table() -> &'static Selector {
     SELECTOR_TABLE.get_or_init(|| Selector::parse("table").unwrap())
 }
-fn selector_h2_or_p() -> &'static Selector {
-    SELECTOR_H2_OR_P.get_or_init(|| Selector::parse("h2, p").unwrap())
+
+fn selector_h1_or_h2_or_p() -> &'static Selector {
+    SELECTOR_H1_OR_H2_OR_P.get_or_init(|| Selector::parse("h1, h2, p").unwrap())
 }
 
 struct ScrapedMeeting {
@@ -112,6 +127,7 @@ struct ScrapedQuestion {
     discussion: String,
     internal_ids: String,
     date: String,
+    is_written: bool,
 }
 
 struct MeetingOutput {
@@ -137,11 +153,16 @@ enum Commission {
     SocialeZakenWerkEnPensioenen,
     BinnenlandseZakenVeiligheidMigratieEnBestuurszaken,
     EconomieConsumentenBeschermingEnDigitalisering,
+    EconomieConsumentenBeschermingEnDigitaleAgenda,
     MobiliteitOverheidsbedrijvenEnFederaleInstellingen,
     GezondheidEnGelijkeKansen,
     EnergieLeefmilieuEnKlimaat,
     InterparlementaireKlimaatdialoog,
     GrondwetEnInstitutioneleVernieuwing,
+    InfrastructuurVerkeerOverheidsbedrijven,
+    BedrijfslevenWetenschapsbeleidOnderwijs,
+    NucleaireVeiligheid,
+    Terrorisme2016,
     Onbekend,
 }
 
@@ -164,6 +185,9 @@ impl fmt::Display for Commission {
             Commission::EconomieConsumentenBeschermingEnDigitalisering => {
                 write!(f, "economie, consumentenbescherming en digitalisering")
             }
+            Commission::EconomieConsumentenBeschermingEnDigitaleAgenda => {
+                write!(f, "economie, consumentenbescherming en digitale agenda")
+            }
             Commission::MobiliteitOverheidsbedrijvenEnFederaleInstellingen => {
                 write!(f, "mobiliteit, overheidsbedrijven en federale instellingen")
             }
@@ -175,6 +199,21 @@ impl fmt::Display for Commission {
             Commission::GrondwetEnInstitutioneleVernieuwing => {
                 write!(f, "grondwet en institutionele vernieuwing")
             }
+            Commission::InfrastructuurVerkeerOverheidsbedrijven => {
+                write!(f, "infrastructuur, het verkeer en de overheidsbedrijven")
+            }
+            Commission::BedrijfslevenWetenschapsbeleidOnderwijs => {
+                write!(
+                    f,
+                    "het bedrijfsleven, het wetenschapsbeleid, het onderwijs, de nationale wetenschappelijke en culturele instellingen, de middenstand en de landbouw"
+                )
+            }
+            Commission::NucleaireVeiligheid => {
+                write!(f, "nucleaire veiligheid")
+            }
+            Commission::Terrorisme2016 => {
+                write!(f, "terrorisme 2016")
+            }
             Commission::Onbekend => write!(f, "onbekend"),
         }
     }
@@ -182,30 +221,40 @@ impl fmt::Display for Commission {
 
 fn parse_commission_type(raw: &str) -> Commission {
     let raw = raw.trim().to_lowercase();
-    if raw.contains("binnenlandse") {
+    if raw.contains("binnenlandse") || raw.contains("intérieur") {
         Commission::BinnenlandseZakenVeiligheidMigratieEnBestuurszaken
-    } else if raw.contains("justitie") {
+    } else if raw.contains("justitie") || raw.contains("justice") {
         Commission::Justitie
-    } else if raw.contains("gezondheid") {
+    } else if raw.contains("gezondheid") || raw.contains("santé") {
         Commission::GezondheidEnGelijkeKansen
-    } else if raw.contains("economie") {
+    } else if raw.contains("digitalisering") {
         Commission::EconomieConsumentenBeschermingEnDigitalisering
-    } else if raw.contains("buitenlandse") {
+    } else if raw.contains("l'agenda numérique") {
+        Commission::EconomieConsumentenBeschermingEnDigitaleAgenda
+    } else if raw.contains("buitenlandse") || raw.contains("relations extérieures") {
         Commission::BuitenlandseBetrekkingen
-    } else if raw.contains("mobiliteit") {
+    } else if raw.contains("mobiliteit") || raw.contains("mobilité") {
         Commission::MobiliteitOverheidsbedrijvenEnFederaleInstellingen
-    } else if raw.contains("landsverdediging") {
+    } else if raw.contains("landsverdediging") || raw.contains("défense") {
         Commission::Landsverdediging
-    } else if raw.contains("energie") {
+    } else if raw.contains("klimaat") || raw.contains("climat") {
         Commission::EnergieLeefmilieuEnKlimaat
     } else if raw.contains("sociale") {
         Commission::SocialeZakenWerkEnPensioenen
-    } else if raw.contains("begroting") {
+    } else if raw.contains("begroting") || raw.contains("budget") {
         Commission::FinancienEnBegroting
     } else if raw.contains("klimaatdialoog") {
         Commission::InterparlementaireKlimaatdialoog
-    } else if raw.contains("grondwet") {
+    } else if raw.contains("grondwet") || raw.contains("constitution") {
         Commission::GrondwetEnInstitutioneleVernieuwing
+    } else if raw.contains("infrastructuur") || raw.contains("infrastructure") {
+        Commission::InfrastructuurVerkeerOverheidsbedrijven
+    } else if raw.contains("wetenschapsbeleid") || raw.contains("politique scientifique") {
+        Commission::BedrijfslevenWetenschapsbeleidOnderwijs
+    } else if raw.contains("nucleaire") {
+        Commission::NucleaireVeiligheid
+    } else if raw.contains("terroristische aanslagen van 22 maart 2016") {
+        Commission::Terrorisme2016
     } else {
         Commission::Onbekend
     }
@@ -214,6 +263,14 @@ fn parse_commission_type(raw: &str) -> Commission {
 macro_rules! col {
     ($rows:expr, $f:expr) => {
         Arc::new(StringArray::from($rows.iter().map($f).collect::<Vec<_>>())) as ArrayRef
+    };
+}
+
+macro_rules! col_bool {
+    ($rows:expr, $f:expr) => {
+        Arc::new(BooleanArray::from(
+            $rows.iter().map($f).collect::<Vec<bool>>(),
+        )) as ArrayRef
     };
 }
 
@@ -269,6 +326,7 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
         Field::new("discussion", DataType::Utf8, false),
         Field::new("internal_ids", DataType::Utf8, false),
         Field::new("date", DataType::Utf8, false),
+        Field::new("is_written", DataType::Boolean, false),
     ]));
     write_parquet(
         path,
@@ -285,11 +343,12 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
             col!(rows, |q| q.discussion.clone()),
             col!(rows, |q| q.internal_ids.clone()),
             col!(rows, |q| q.date.clone()),
+            col_bool!(rows, |q| q.is_written),
         ],
     )
 }
 
-const SESSION_IDS: &[u32] = &[56, 55];
+const SESSION_IDS: &[u32] = &[56, 55]; //, 54];
 const LATEST_SESSION_ID: u32 = 56;
 
 #[tokio::main]
@@ -592,16 +651,21 @@ fn extract_questions(
     let mut previous_discussion = String::new();
     let mut question_id: i32 = 0;
 
+    // True while we're under the h1 "Schriftelijk behandelde mondelinge vragen"
+    let mut in_written_section = false;
+
     let flush_question = |id: i32,
                           nl: &str,
                           fr: &str,
-                          discussion: &str|
+                          discussion: &str,
+                          written: bool|
      -> Result<Option<ScrapedQuestion>, Box<dyn Error>> {
         if nl.is_empty() && fr.is_empty() {
             return Ok(None);
         }
-        let data_nl = extract_question_data(nl, discussion)?;
-        let data_fr = extract_question_data(fr, discussion)?;
+        let data_nl = extract_question_data(nl, discussion, written)?;
+        let data_fr = extract_question_data(fr, discussion, written)?;
+
         Ok(Some(ScrapedQuestion {
             question_id: id,
             session_id,
@@ -614,11 +678,59 @@ fn extract_questions(
             discussion: data_nl.discussion,
             internal_ids: data_nl.internal_ids.join(","),
             date: date.to_string(),
+            is_written: written,
         }))
     };
 
-    for element in document.select(selector_h2_or_p()) {
+    macro_rules! flush_pending {
+        () => {
+            if let Some(q) = flush_question(
+                question_id,
+                &previous_nl,
+                &previous_fr,
+                &previous_discussion,
+                in_written_section,
+            )? {
+                questions.push(q);
+                question_id += 1;
+            }
+        };
+    }
+    macro_rules! clear_pending {
+        () => {
+            previous_nl.clear();
+            previous_fr.clear();
+            previous_discussion.clear();
+        };
+    }
+
+    for element in document.select(selector_h1_or_h2_or_p()) {
         let tag = element.value().name();
+
+        if tag == "h1" {
+            // Section boundary: whatever is pending belongs to the previous section,
+            // so flush it using the *old* mode before switching.
+            if !previous_nl.is_empty() && !previous_fr.is_empty() {
+                flush_pending!();
+            }
+            // Also drops intro paragraphs that would otherwise leak into the next question.
+            clear_pending!();
+
+            let heading = element
+                .text()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            if heading.contains("schriftelijk") || heading.contains("par écrit") {
+                in_written_section = true;
+            } else if !heading.is_empty() {
+                in_written_section = false;
+            }
+            continue;
+        }
 
         if tag == "h2" {
             let (nl_text, fr_text) = extract_bilingual_spans(&element);
@@ -628,60 +740,54 @@ fn extract_questions(
                 if text.trim().is_empty() {
                     continue;
                 }
+
                 let lower = text.to_lowercase();
-                let is_hearing = lower.contains("hoorzitting") || lower.contains("audition");
-                if is_hearing {
-                    if !previous_nl.is_empty() && !previous_fr.is_empty() {
-                        if let Some(q) = flush_question(
-                            question_id,
-                            &previous_nl,
-                            &previous_fr,
-                            &previous_discussion,
-                        )? {
-                            questions.push(q);
-                            question_id += 1;
-                        }
-                    }
-                    previous_nl.clear();
-                    previous_fr.clear();
-                    previous_discussion.clear();
-                    continue;
-                }
+
                 let is_group_start = text.starts_with("Samengevoegde")
                     || text.contains("toegevoegde vragen")
                     || text.contains("jointes");
                 let is_subquestion = text.starts_with('-');
                 let is_single = text.starts_with("Vraag van") || text.starts_with("Question de");
+
+                let is_hearing = !is_group_start
+                    && !is_subquestion
+                    && !is_single
+                    && (lower.contains("hoorzitting") || lower.contains("audition"));
+
+                if is_hearing {
+                    if !previous_nl.is_empty() && !previous_fr.is_empty() {
+                        flush_pending!();
+                    }
+                    clear_pending!();
+                    continue;
+                }
+
+                // Nothing pending means a fresh question starts here, so any paragraphs
+                // collected so far are section intro text (e.g. "De antwoorden werden door
+                // de ... bezorgd.") and not part of this question.
+                if (is_group_start || is_single || is_subquestion)
+                    && previous_nl.is_empty()
+                    && previous_fr.is_empty()
+                {
+                    previous_discussion.clear();
+                }
+
                 if is_group_start || is_single {
                     if !previous_nl.is_empty() && !previous_fr.is_empty() {
-                        if let Some(q) = flush_question(
-                            question_id,
-                            &previous_nl,
-                            &previous_fr,
-                            &previous_discussion,
-                        )? {
-                            questions.push(q);
-                            question_id += 1;
-                        }
-                        previous_discussion.clear();
-                        previous_nl.clear();
-                        previous_fr.clear();
+                        flush_pending!();
+                        clear_pending!();
                     }
                     match lang {
                         SectionLang::Nl => previous_nl = text,
                         SectionLang::Fr => previous_fr = text,
                     }
                 } else if is_subquestion {
-                    match lang {
-                        SectionLang::Nl => {
-                            previous_nl.push('\n');
-                            previous_nl.push_str(&text);
-                        }
-                        SectionLang::Fr => {
-                            previous_fr.push('\n');
-                            previous_fr.push_str(&text);
-                        }
-                    }
+                    let target = match lang {
+                        SectionLang::Nl => &mut previous_nl,
+                        SectionLang::Fr => &mut previous_fr,
+                    };
+                    target.push('\n');
+                    target.push_str(&text);
                 }
             }
         }
@@ -699,16 +805,11 @@ fn extract_questions(
             }
         }
     }
+
     if !previous_nl.is_empty() && !previous_fr.is_empty() {
-        if let Some(q) = flush_question(
-            question_id,
-            &previous_nl,
-            &previous_fr,
-            &previous_discussion,
-        )? {
-            questions.push(q);
-        }
+        flush_pending!();
     }
+
     Ok(questions)
 }
 
@@ -789,20 +890,47 @@ fn handle_one_off_issues(text: String, session_id: u32, meeting_id: u32) -> Stri
         text = text.replace("Matti Vandael", "Matti Vandemaele");
     }
 
+    // IC56012: contains 'Eric Thiébaut' which should be 'Éric Thiébaut'
+    if session_id == 56 && meeting_id == 12 {
+        text = text.replace("Eric Thiébaut", "Éric Thiébaut");
+    }
+
+    // IC56107: questionee is only given by function title, not by name
+    if session_id == 56 && meeting_id == 107 {
+        text = text.replace(
+            "de vice-eersteminister en minister van Werk, Economie en Landbouw",
+            "David Clarinval",
+        );
+        text = text.replace(
+            "vice-premier ministre et ministre de l'Emploi, de l'Économie et de l'Agriculture",
+            "David Clarinval",
+        );
+    }
+
     text
+}
+
+/// Push `value` onto `list` only if it isn't already present (order-preserving dedup).
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
 }
 
 fn extract_question_data(
     question_text: &str,
     discussion_text: &str,
+    written: bool,
 ) -> Result<QuestionData, Box<dyn Error>> {
     let mut questioners = Vec::new();
     let mut topics = Vec::new();
     let mut questionees = Vec::new();
     let mut internal_ids = Vec::new();
+    let mut id_questioners: Vec<(String, String)> = Vec::new();
 
     for capture in question_regex().captures_iter(question_text) {
-        let dossier_id = format!("Q{}", capture[4].trim());
+        let raw_id = capture[4].trim().to_uppercase();
+        let dossier_id = format!("Q{}", raw_id);
 
         // FIX: IC56209 Q16 contains an exact copy-pasted subquestion.
         // --> Treat as the same question rather than a distinct one
@@ -822,27 +950,48 @@ fn extract_question_data(
             .unwrap_or_else(|| "Onbekend".to_string());
         let topic = capture[3].trim().to_string();
 
-        questioners.push(questioner);
-        if !questionees.contains(&questionee) {
-            questionees.push(questionee);
-        }
+        id_questioners.push((raw_id, questioner.clone()));
+        push_unique(&mut questioners, questioner);
+        push_unique(&mut questionees, questionee);
         internal_ids.push(dossier_id);
         topics.push(topic);
     }
 
-    // The actual respondents may differ from the questionees so we need to extract the actual respondents from the discussion text.
-    let speakers = extract_speakers_from_discussion(discussion_text);
-    let respondents: Vec<String> = speakers
-        .into_iter()
-        .filter(|s| !questioners.contains(s))
-        .collect();
+    let (mut respondents, discussion) = if written {
+        // Written questions have no speaker markers. The respondent is whoever the
+        // question was addressed to, but only if the government actually answered.
+        let addressed: Vec<String> = questionees
+            .iter()
+            .filter(|q| q.as_str() != "Onbekend")
+            .cloned()
+            .collect();
+        let (json, has_answer) =
+            get_written_discussion_json(discussion_text, &id_questioners, &questioners, &addressed);
+        // "Het antwoord werd niet tijdig door de regering bezorgd." (or no answer at all)
+        // means nobody responded.
+        let respondents = if has_answer { addressed } else { Vec::new() };
+        (respondents, json)
+    } else {
+        // The actual respondents may differ from the questionees, so take them from the discussion.
+        let respondents: Vec<String> = extract_speakers_from_discussion(discussion_text)
+            .into_iter()
+            .filter(|s| !questioners.contains(s))
+            .collect();
+        (respondents, get_discussion_json(discussion_text))
+    };
+
+    // No respondent means the question was never answered
+    // (e.g. the questioner withdrew it, or the government didn't reply in time).
+    if respondents.is_empty() {
+        respondents.push(NO_RESPONDENT.to_string());
+    }
 
     Ok(QuestionData {
         questioners,
         questionees,
         respondents,
         topics,
-        discussion: get_discussion_json(discussion_text),
+        discussion,
         internal_ids,
     })
 }
@@ -858,7 +1007,7 @@ fn extract_speakers_from_discussion(discussion_text: &str) -> Vec<String> {
             continue;
         };
         let cleaned = normalize_speaker_name(&raw);
-        if !seen.contains(&cleaned) {
+        if !seen.contains(&cleaned) && !is_chair_name(&cleaned) {
             seen.push(cleaned);
         }
     }
@@ -894,6 +1043,137 @@ fn discussion_speaker_regex() -> &'static Regex {
     })
 }
 
+fn chair_handover_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:Voorzitter|Voorzitster|Président|Présidente)\s*:\s*[A-ZÀ-Ý][^\n.]*\.")
+            .unwrap()
+    })
+}
+
+fn is_chair_name(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    lower.ends_with("voorzitter")
+        || lower.ends_with("voorzitster")
+        || lower.ends_with("président")
+        || lower.ends_with("présidente")
+}
+
+fn answer_marker_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Matches the paragraph "Antwoord - Réponse:" (the source has a line break inside it)
+    RE.get_or_init(|| Regex::new(r"(?i)^antwoord\s*[-–—]\s*r[ée]ponse\s*:?$").unwrap())
+}
+
+/// Boilerplate the Chamber prints when the minister didn't reply in time.
+const NO_ANSWER_MARKERS: &[&str] = &[
+    "het antwoord werd niet tijdig door de regering bezorgd",
+    "la réponse n'a pas été fournie par le gouvernement",
+];
+
+/// Placeholder for questions nobody answered.
+const NO_RESPONDENT: &str = "NA";
+
+/// Parse a written question: [question paragraphs] "Antwoord - Réponse:" [answer paragraphs].
+/// Returns (discussion_json, has_answer).
+fn get_written_discussion_json(
+    discussion_text: &str,
+    id_questioners: &[(String, String)],
+    questioners: &[String],
+    respondents: &[String],
+) -> (String, bool) {
+    let paragraphs: Vec<&str> = discussion_text
+        .split("NEWPARAGRAPH")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    // Index into `id_questioners` if the paragraph is nothing but a known question ID.
+    let id_index = |p: &str| -> Option<usize> {
+        let cap = question_id_marker_regex().captures(p)?;
+        let id = cap[1].to_uppercase();
+        id_questioners.iter().position(|(i, _)| *i == id)
+    };
+
+    // Explicit IDs take priority; positional "1)", "2)" markers are only the fallback.
+    let uses_id_markers = paragraphs.iter().any(|&p| id_index(p).is_some());
+    let allow_positional = !uses_id_markers && id_questioners.len() > 1;
+
+    // (speaker, paragraphs). The first segment is the fallback for text before any marker.
+    let mut segments: Vec<(String, Vec<&str>)> = vec![(questioners.join(", "), Vec::new())];
+    let mut answer_parts: Vec<&str> = Vec::new();
+    let mut in_answer = false;
+    let mut next_position = 0usize;
+
+    for p in paragraphs {
+        if !in_answer && answer_marker_regex().is_match(p) {
+            in_answer = true;
+            continue;
+        }
+        if in_answer {
+            answer_parts.push(p);
+            continue;
+        }
+
+        let mut text = p;
+        let mut start: Option<usize> = None;
+
+        if uses_id_markers {
+            if let Some(i) = id_index(p) {
+                start = Some(i);
+                text = ""; // the ID itself is not part of the text
+            }
+        } else if allow_positional && next_position < id_questioners.len() {
+            if let Some(cap) = positional_marker_regex().captures(p) {
+                if cap[1].parse::<usize>().ok() == Some(next_position + 1) {
+                    start = Some(next_position);
+                    next_position += 1;
+                    text = cap.get(2).map_or("", |m| m.as_str().trim());
+                }
+            }
+        }
+
+        if let Some(i) = start {
+            let speaker = id_questioners[i].1.clone();
+            let current_is_empty = segments.last().map_or(true, |(_, parts)| parts.is_empty());
+            if current_is_empty {
+                segments.last_mut().unwrap().0 = speaker;
+            } else {
+                segments.push((speaker, Vec::new()));
+            }
+        }
+        if !text.is_empty() {
+            segments.last_mut().unwrap().1.push(text);
+        }
+    }
+
+    let answer_text = answer_parts.join("\n\n");
+    let normalized = answer_text.to_lowercase().replace('\u{2019}', "'");
+    let has_answer =
+        !answer_text.is_empty() && !NO_ANSWER_MARKERS.iter().any(|m| normalized.contains(m));
+
+    let mut discussion = Vec::new();
+    for (speaker, parts) in &segments {
+        if !parts.is_empty() {
+            discussion.push(json!({
+                "speaker": speaker,
+                "text": parts.join("\n\n"),
+            }));
+        }
+    }
+    if has_answer {
+        discussion.push(json!({
+            "speaker": respondents.join(", "),
+            "text": answer_text,
+        }));
+    }
+
+    (
+        serde_json::to_string_pretty(&discussion).unwrap(),
+        has_answer,
+    )
+}
+
 fn get_discussion_json(input: &str) -> String {
     let cleaned_input = clean_text(input);
     // NOTE: The timestamp regex anchors on NEWPARAGRAPH / line-start to avoid false-positives
@@ -908,9 +1188,13 @@ fn get_discussion_json(input: &str) -> String {
         let text_segment = cleaned_input[last_end..match_start].trim();
 
         if !current_speaker.is_empty() && !text_segment.is_empty() {
-            let clean_segment = text_segment
-                .replace("Het incident is gesloten.", "")
-                .replace("L'incident est clos.", "")
+            let clean_segment = chair_handover_regex()
+                .replace_all(
+                    &text_segment
+                        .replace("Het incident is gesloten.", "")
+                        .replace("L'incident est clos.", ""),
+                    "",
+                )
                 .trim()
                 .to_string();
             if !clean_segment.is_empty() {
@@ -923,10 +1207,16 @@ fn get_discussion_json(input: &str) -> String {
             let stripped = titles_regex()
                 .replace(full_speaker.as_str().trim(), "")
                 .to_string();
-            speaker_name_regex()
+            let name = speaker_name_regex()
                 .captures(&stripped)
                 .and_then(|c| c.get(0))
-                .map_or("Onbekend".to_string(), |m| m.as_str().to_string())
+                .map_or("Onbekend".to_string(), |m| m.as_str().to_string());
+
+            if is_chair_name(&name) {
+                "Voorzitter".to_string()
+            } else {
+                name
+            }
         } else {
             "Voorzitter".to_string()
         };
@@ -935,10 +1225,14 @@ fn get_discussion_json(input: &str) -> String {
     }
 
     if !current_speaker.is_empty() && last_end < cleaned_input.len() {
-        let clean_segment = cleaned_input[last_end..]
-            .replace("Het incident is gesloten.", "")
-            .replace("L'incident est clos.", "")
-            .replace("NEWPARAGRAPH", "\n")
+        let clean_segment = chair_handover_regex()
+            .replace_all(
+                &cleaned_input[last_end..]
+                    .replace("Het incident is gesloten.", "")
+                    .replace("L'incident est clos.", "")
+                    .replace("NEWPARAGRAPH", "\n"),
+                "",
+            )
             .trim()
             .to_string();
         if !clean_segment.is_empty() {
