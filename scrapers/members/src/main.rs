@@ -1052,7 +1052,7 @@ fn split_name(name: &str) -> (String, String) {
 fn fix_name(first_name: String, last_name: String) -> (String, String) {
     let first_name = match first_name.as_str() {
         "Karine" if last_name == "Jiroflée" => "Karin".to_string(),
-        "Éric" if last_name == "Thiébaut" => "Eric".to_string(),
+        "Eric" if last_name == "Thiébaut" => "Éric".to_string(),
         _ => first_name,
     };
 

@@ -17,6 +17,9 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::fs;
 
+/// OTHER
+const DETAILS_NOT_AVAILABLE: &str = "NA";
+
 /// REGEXES
 static PARAGRAPH_VOTE_REGEX: OnceLock<Regex> = OnceLock::new();
 static PARAGRAPH_VOTE_SECTION_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -402,7 +405,8 @@ fn write_notices(path: &Path, rows: &[ScrapedNotice]) -> Result<(), Box<dyn Erro
     )
 }
 
-const SESSION_IDS: &[u32] = &[56, 55];
+const SESSION_IDS: &[u32] = &[56, 55]; //, 54, 53, 52, 51, 50];
+const LATEST_SESSION_ID: u32 = 56;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -424,13 +428,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Scrape a single session.
 async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), Box<dyn Error>> {
-    let session_dir = data_dir()
+    let plenary_dir = data_dir()
         .join("sessions")
         .join(session_id.to_string())
         .join("plenary");
-    fs::create_dir_all(&session_dir).await?;
+    fs::create_dir_all(&plenary_dir).await?;
 
-    let meeting_id_path = session_dir.join("current_plenary_id.txt");
+    let meeting_id_path = plenary_dir.join("current_plenary_id.txt");
     let current_meeting_id: u32 = if meeting_id_path.exists() {
         std::fs::read_to_string(&meeting_id_path)?.trim().parse()?
     } else {
@@ -438,13 +442,17 @@ async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), 
     };
 
     let mut web_request_count = 0u32;
-    let last_meeting_id = discover_last_meeting_id(
-        client,
-        session_id,
-        current_meeting_id,
-        &mut web_request_count,
-    )
-    .await?;
+    let last_meeting_id = if session_id == LATEST_SESSION_ID {
+        discover_last_meeting_id(
+            client,
+            session_id,
+            current_meeting_id,
+            &mut web_request_count,
+        )
+        .await?
+    } else {
+        current_meeting_id
+    };
 
     if last_meeting_id == current_meeting_id {
         println!(
@@ -505,8 +513,8 @@ async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), 
         meetings_pb.inc(1);
     }
 
-    // Write collected dossier ids
-    let ids_path = cache_dir().join(format!("sessions/{}/dossier_ids.txt", session_id));
+    // Write collected dossier ids to data folder
+    let ids_path = plenary_dir.join("dossier_ids.txt");
     let mut lines: Vec<String> = encountered_dossier_ids
         .iter()
         .map(|(id, date)| format!("{}\t{}", id, date))
@@ -517,11 +525,11 @@ async fn scrape_session(client: &ScrapingClient, session_id: u32) -> Result<(), 
     meetings_pb.finish_with_message("done");
     std::fs::write(&meeting_id_path, last_meeting_id.to_string())?;
 
-    write_meetings(&session_dir.join("meetings.parquet"), &all_meetings)?;
-    write_questions(&session_dir.join("questions.parquet"), &all_questions)?;
-    write_propositions(&session_dir.join("propositions.parquet"), &all_propositions)?;
-    write_notices(&session_dir.join("notices.parquet"), &all_notices)?;
-    write_votes(&session_dir.join("votes.parquet"), &all_votes)?;
+    write_meetings(&plenary_dir.join("meetings.parquet"), &all_meetings)?;
+    write_questions(&plenary_dir.join("questions.parquet"), &all_questions)?;
+    write_propositions(&plenary_dir.join("propositions.parquet"), &all_propositions)?;
+    write_notices(&plenary_dir.join("notices.parquet"), &all_notices)?;
+    write_votes(&plenary_dir.join("votes.parquet"), &all_votes)?;
 
     println!(
         "[meetings-plenary] session {}: scraped {} meetings using {} web requests",
@@ -560,21 +568,44 @@ async fn discover_last_meeting_id(
 
         println!("[meetings-plenary] probing meeting {}...", probe);
 
-        let url = format!(
-            "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
-            session_id, probe
-        );
+        let urls = if session_id <= 51 {
+            vec![
+                format!(
+                    "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}.html",
+                    session_id, probe
+                ),
+                format!(
+                    "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
+                    session_id, probe
+                ),
+            ]
+        } else {
+            vec![format!(
+                "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
+                session_id, probe
+            )]
+        };
 
-        let resp = client.get(&url).await?;
-        *web_request_count += 1;
+        let mut found = false;
 
-        println!(
-            "[meetings-plenary] meeting {} -> HTTP {}",
-            probe,
-            resp.status()
-        );
+        for url in urls {
+            let resp = client.get(&url).await?;
+            *web_request_count += 1;
 
-        if resp.status() == StatusCode::NOT_FOUND {
+            println!(
+                "[meetings-plenary] meeting {} -> {} HTTP {}",
+                probe,
+                url,
+                resp.status()
+            );
+
+            if resp.status() != StatusCode::NOT_FOUND {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
             break;
         }
 
@@ -602,12 +633,44 @@ async fn scrape_meeting(
     ));
 
     if !filepath.exists() {
-        let url = format!(
-            "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
-            session_id, meeting_id
-        );
-        let response = client.get(&url).await?;
-        *web_request_count += 1;
+        // NOTE: Session 51 and later use ip{:03}x.html URLs, 51 and before use ip{:03}.html URLs
+        let urls = if session_id <= 51 {
+            vec![
+                format!(
+                    "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}.html",
+                    session_id, meeting_id
+                ),
+                format!(
+                    "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
+                    session_id, meeting_id
+                ),
+            ]
+        } else {
+            vec![format!(
+                "https://www.dekamer.be/doc/PCRI/html/{}/ip{:03}x.html",
+                session_id, meeting_id
+            )]
+        };
+
+        let mut response = None;
+
+        for url in urls {
+            let candidate = client.get(&url).await?;
+            *web_request_count += 1;
+
+            if candidate.status() != StatusCode::NOT_FOUND {
+                response = Some(candidate);
+                break;
+            }
+        }
+
+        let response = response.ok_or_else(|| {
+            format!(
+                "Could not find meeting {} for session {}",
+                meeting_id, session_id
+            )
+        })?;
+
         let raw_bytes = response.bytes().await?;
         let (decoded_str, _, _) = WINDOWS_1252.decode(&raw_bytes);
         if let Some(parent) = filepath.parent() {
@@ -1427,8 +1490,17 @@ async fn extract_votes(
             }
 
             // Get names from vote appendix in document.
+            let vote_index = vote.vote_number.trim();
             let (yes_names, no_names, abstain_names) =
-                extract_voter_names(document, &vote.vote_number.trim());
+                if voter_details_unavailable(document, vote_index) {
+                    (
+                        DETAILS_NOT_AVAILABLE.to_string(),
+                        DETAILS_NOT_AVAILABLE.to_string(),
+                        DETAILS_NOT_AVAILABLE.to_string(),
+                    )
+                } else {
+                    extract_voter_names(document, vote_index)
+                };
 
             // Store vote in known results so other votes can reuse it.
             known_vote_results.insert(
@@ -1514,6 +1586,52 @@ fn extract_vote_data(vote_text: String) -> Result<VoteData, Box<dyn Error>> {
         });
     }
     Err("No regex matched for vote text".into())
+}
+
+/// Returns true if the appendix entry for this vote says the voter details are unavailable, e.g.
+/// "Wegens technische redenen is het detail van de stemming niet beschikbaar."
+/// This is the case for a vote in plenary meeting 140.
+fn voter_details_unavailable(document: &Html, vote_index: &str) -> bool {
+    let markers = ["wegens technische redenen", "pour des raisons techniques"];
+
+    for span in document.select(selector_span()) {
+        let text = span
+            .text()
+            .flat_map(|t| t.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if !(text.contains(&format!("Vote nominatif - Naamstemming: {}", vote_index))
+            || text.contains(&format!("Naamstemming - Vote nominatif: {}", vote_index)))
+        {
+            continue;
+        }
+
+        // Walk the siblings of the header <p> until we hit the first detail table.
+        let mut node = span.parent().and_then(|p| p.next_sibling());
+        while let Some(n) = node {
+            if let Some(el) = ElementRef::wrap(n) {
+                match el.value().name() {
+                    "table" => return false,
+                    "p" => {
+                        let p_text = el
+                            .text()
+                            .flat_map(|t| t.split_whitespace())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .to_lowercase();
+                        if markers.iter().any(|m| p_text.contains(m)) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            node = n.next_sibling();
+        }
+        return false;
+    }
+    false
 }
 
 fn convert_voter_names(raw: &str) -> String {
