@@ -158,12 +158,14 @@ fn selector_email() -> &'static Selector {
 static FRACTION_DISPLAY_NAMES: LazyLock<HashMap<&'static str, &'static str>> =
     LazyLock::new(|| {
         HashMap::from([
-            ("cd&v", "CD&V"),
+            ("cd&v", "cd&v"),
+            ("cd&v - n-va", "cd&v - N-VA"),
             ("anders.", "Anders."),
             ("vb", "VB"),
             ("pvda-ptb", "PVDA-PTB"),
             ("ps", "PS"),
             ("ecolo-groen!", "Ecolo-Groen!"),
+            ("ecolo-groen", "Ecolo-Groen"),
             ("mr", "MR"),
             ("n-va", "N-VA"),
             ("vooruit", "Vooruit"),
