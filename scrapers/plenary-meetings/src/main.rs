@@ -831,7 +831,20 @@ async fn extract_questions(
         }
 
         if heading == Some(HeadingLevel::H2) {
-            let (found_nl, found_fr) = extract_bilingual_spans(&element);
+            let (mut found_nl, mut found_fr) = extract_bilingual_spans(&element);
+
+            // Fallback: no span had a lang attribute (IP55 meeting with only `mso-ansi-language:FR-BE` in style).
+            if found_nl.is_none() && found_fr.is_none() {
+                let text = normalize_leading_dash(
+                    clean_text(&normalized_text(&element)).replace("\"", ""),
+                );
+                if text.contains(" aan ") {
+                    found_nl = Some(text);
+                } else if text.contains(" à ") {
+                    found_fr = Some(text);
+                }
+            }
+
             let found_nl = found_nl.map(|t| handle_one_off_issues(t, session_id, meeting_id));
             let found_fr = found_fr.map(|t| handle_one_off_issues(t, session_id, meeting_id));
 
