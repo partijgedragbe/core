@@ -1,8 +1,8 @@
 scrape-sessions:
     cargo run --bin sessions
 
-scrape-plenary-meetings:
-    cargo run --bin plenary-meetings
+scrape-plenary-meetings *sessions:
+    cargo run --release --bin plenary-meetings -- {{sessions}}
 
 scrape-commission-meetings:
     cargo run --bin commission-meetings
