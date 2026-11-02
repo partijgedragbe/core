@@ -405,8 +405,23 @@ fn write_notices(path: &Path, rows: &[ScrapedNotice]) -> Result<(), Box<dyn Erro
     )
 }
 
-const SESSION_IDS: &[u32] = &[56, 55]; //, 54, 53, 52, 51, 50];
+const DEFAULT_SESSION_IDS: &[u32] = &[56];
 const LATEST_SESSION_ID: u32 = 56;
+
+fn parse_sessions() -> Result<Vec<u32>, Box<dyn Error>> {
+    let sessions = std::env::args()
+        .skip(1)
+        .map(|a| {
+            a.parse::<u32>()
+                .map_err(|_| format!("invalid session id: {a}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(if sessions.is_empty() {
+        DEFAULT_SESSION_IDS.to_vec()
+    } else {
+        sessions
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -414,7 +429,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let client = ScrapingClient::new();
 
-    for &session_id in SESSION_IDS {
+    for session_id in parse_sessions()? {
         if let Err(err) = scrape_session(&client, session_id).await {
             eprintln!(
                 "[meetings-plenary] session {} failed entirely: {}",
@@ -780,17 +795,15 @@ async fn extract_questions(
         "questions",
     ];
 
-    for element in document.select(selector_h1_or_h2_or_p()) {
-        let tag = element.value().name();
+    // NOTE: In plenary meeting 145 and 146 of session 56, <p class="Titre1.."/"Titre2.."> is used
+    // instead of the usual <h1>/<h2> headings.
+    let allow_p_headings = session_id == 56 && (meeting_id == 145 || meeting_id == 146);
 
-        if tag == "h1" {
-            let text = element
-                .text()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .replace("\n", " ")
-                .trim()
-                .to_lowercase();
+    for element in document.select(selector_h1_or_h2_or_p()) {
+        let heading = heading_level(&element, allow_p_headings);
+
+        if heading == Some(HeadingLevel::H1) {
+            let text = normalized_text(&element).to_lowercase();
 
             if questions_section_keywords
                 .iter()
@@ -817,24 +830,29 @@ async fn extract_questions(
             continue;
         }
 
-        if tag == "h2" {
+        if heading == Some(HeadingLevel::H2) {
             let (found_nl, found_fr) = extract_bilingual_spans(&element);
+            let found_nl = found_nl.map(|t| handle_one_off_issues(t, session_id, meeting_id));
+            let found_fr = found_fr.map(|t| handle_one_off_issues(t, session_id, meeting_id));
 
-            let is_group_start = found_nl
-                .as_deref()
-                .map_or(false, |t| t.starts_with("Samengevoegde"))
-                || found_fr.as_deref().map_or(false, |t| t.contains("jointes"));
+            let is_group_start = found_nl.as_deref().map_or(false, is_group_header_nl)
+                || found_fr.as_deref().map_or(false, is_group_header_fr);
             let is_subquestion = found_nl.as_deref().map_or(false, |t| t.starts_with("-"))
                 || found_fr.as_deref().map_or(false, |t| t.starts_with("-"));
             let is_single = found_nl
                 .as_deref()
-                .map_or(false, |t| t.starts_with("Vraag van"))
+                .map_or(false, |t| t.to_lowercase().starts_with("vraag van"))
                 || found_fr
                     .as_deref()
-                    .map_or(false, |t| t.starts_with("Question de"));
+                    .map_or(false, |t| t.to_lowercase().starts_with("question de"));
 
             // If it's none of the above, it's a non-question h2 — flush and stop.
             if !is_group_start && !is_subquestion && !is_single {
+                // eprintln!(
+                //     "[extract_questions] session {} meeting {}: ending questions section at h2 nl={:?} fr={:?}",
+                //     session_id, meeting_id, found_nl, found_fr
+                // );
+
                 if let Some(q) = flush_question(
                     question_id,
                     &previous_nl,
@@ -881,35 +899,37 @@ async fn extract_questions(
             }
         }
 
-        if tag == "p" {
-            let text = element
+        let text = handle_one_off_issues(
+            element
                 .text()
                 .collect::<Vec<_>>()
                 .join(" ")
                 .trim()
-                .to_string();
+                .to_string(),
+            session_id,
+            meeting_id,
+        );
 
-            if text.contains("Het incident is gesloten") || text.contains("L'incident est clos") {
-                if let Some(q) = flush_question(
-                    question_id,
-                    &previous_nl,
-                    &previous_fr,
-                    &previous_discussion,
-                    typo_map,
-                )? {
-                    questions.push(q);
-                    question_id += 1;
-                }
-                previous_discussion.clear();
-                previous_nl.clear();
-                previous_fr.clear();
-                continue;
+        if text.contains("Het incident is gesloten") || text.contains("L'incident est clos") {
+            if let Some(q) = flush_question(
+                question_id,
+                &previous_nl,
+                &previous_fr,
+                &previous_discussion,
+                typo_map,
+            )? {
+                questions.push(q);
+                question_id += 1;
             }
+            previous_discussion.clear();
+            previous_nl.clear();
+            previous_fr.clear();
+            continue;
+        }
 
-            if !text.is_empty() && (!previous_nl.is_empty() || !previous_fr.is_empty()) {
-                previous_discussion.push_str(&clean_text(&text));
-                previous_discussion.push_str("NEWPARAGRAPH");
-            }
+        if !text.is_empty() && (!previous_nl.is_empty() || !previous_fr.is_empty()) {
+            previous_discussion.push_str(&clean_text(&text));
+            previous_discussion.push_str("NEWPARAGRAPH");
         }
     }
 
@@ -1203,6 +1223,42 @@ async fn extract_notices(
     }
 
     Ok(notices)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadingLevel {
+    H1,
+    H2,
+}
+
+/// Returns the heading level of an element, or `None` for regular paragraphs.
+/// Normally headings are <h1>/<h2>. When `allow_p_headings` is set, Word-style
+/// <p class="Titre1NL|FR"> and <p class="Titre2NL|FR"> count as headings too.
+fn heading_level(element: &ElementRef, allow_p_headings: bool) -> Option<HeadingLevel> {
+    match element.value().name() {
+        "h1" => Some(HeadingLevel::H1),
+        "h2" => Some(HeadingLevel::H2),
+        "p" if allow_p_headings => {
+            let class = element.value().attr("class")?;
+            if class.starts_with("Titre1") {
+                Some(HeadingLevel::H1)
+            } else if class.starts_with("Titre2") {
+                Some(HeadingLevel::H2)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Element text with all whitespace (including newlines) collapsed to single spaces.
+fn normalized_text(element: &ElementRef) -> String {
+    element
+        .text()
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 struct CachedVote {
@@ -1643,8 +1699,12 @@ fn convert_voter_names(raw: &str) -> String {
 
 /// Extract NL/FR spans, swapping where misclassified by the source HTML.
 fn extract_bilingual_spans(element: &ElementRef) -> (Option<String>, Option<String>) {
-    let french_indicators = ["questions jointes"];
-    let dutch_indicators = ["samengevoegde vragen"];
+    let french_indicators = ["questions jointes", "débat d'actualité"];
+    let dutch_indicators = [
+        "samengevoegde vragen",
+        "toegevoegde vragen",
+        "actualiteitsdebat",
+    ];
 
     let mut nl: Option<String> = None;
     let mut fr: Option<String> = None;
@@ -1736,6 +1796,28 @@ fn is_likely_dutch(text: &str) -> bool {
         .split_whitespace()
         .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()))
         .any(|w| dutch_core_words.contains(&w))
+}
+
+/// A "joint questions" header in Dutch. Several wordings exist in the reports:
+/// "Samengevoegde vragen van", "Actualiteitsdebat over ... met de toegevoegde vragen van", ...
+fn is_group_header_nl(text: &str) -> bool {
+    if text.starts_with('-') {
+        return false; // sub-questions can mention these words in their topic
+    }
+    let l = text.to_lowercase();
+    l.contains("samengevoegde vragen")
+        || l.contains("toegevoegde vragen")
+        || l.contains("actualiteitsdebat")
+}
+
+/// A "joint questions" header in French:
+/// "Questions jointes de", "Débat d'actualité sur ... avec les questions jointes de", ...
+fn is_group_header_fr(text: &str) -> bool {
+    if text.starts_with('-') {
+        return false;
+    }
+    let l = text.to_lowercase();
+    l.contains("questions jointes") || l.contains("débat d'actualité")
 }
 
 fn extract_proposition_data(proposition_text: String) -> Result<PropositionData, Box<dyn Error>> {
@@ -2242,4 +2324,42 @@ fn extract_time_from_document(document: &Html, keyword: &str) -> Result<String, 
         })
         .last()
         .ok_or_else(|| "Could not extract time from the document".into())
+}
+
+/// Handle one-off mistakes from the plenary meeting reports.
+fn handle_one_off_issues(text: String, session_id: u32, meeting_id: u32) -> String {
+    let mut text = text;
+
+    // IP55192 AND IP55245: contain 'Eric Thiébaut' which should be 'Éric Thiébaut'
+    if session_id == 55 && (meeting_id == 192 || meeting_id == 245) {
+        text = text.replace("Eric Thiébaut", "Éric Thiébaut");
+    }
+
+    // IP55274: contains 'Alexander De  Croo' which should be 'Alexander De Croo'
+    if session_id == 55 && meeting_id == 274 {
+        text = text.replace("Alexander De  Croo", "Alexander De Croo");
+    }
+
+    // IP55214 AND IP55177: 'Eerste m</span><span>inister' is split over two spans, which
+    // element.text().join(" ") turns into 'Eerste m inister'
+    if session_id == 55 && (meeting_id == 214 || meeting_id == 177) {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"Eerste\s+m\s+inister").unwrap());
+        text = re.replace_all(&text, "Eerste minister").into_owned();
+    }
+
+    // IP55230: contains 'Marie-Coline Leroy' which should be 'Marie-Colline Leroy'
+    if session_id == 55 && meeting_id == 230 {
+        text = text.replace("Marie-Coline Leroy", "Marie-Colline Leroy");
+    }
+
+    // IP55270: contains 'inister Vincent Van Peteghem' instead of 'Minister Vincent Van Peteghem'
+    // IP55270: 'inister Vincent Van Peteghem' instead of 'Minister Vincent Van Peteghem'
+    if session_id == 55 && meeting_id == 270 {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"\binister\b").unwrap());
+        text = re.replace_all(&text, "Minister").into_owned();
+    }
+
+    text
 }
