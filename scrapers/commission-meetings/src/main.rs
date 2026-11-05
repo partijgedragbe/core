@@ -348,8 +348,23 @@ fn write_questions(path: &Path, rows: &[ScrapedQuestion]) -> Result<(), Box<dyn 
     )
 }
 
-const SESSION_IDS: &[u32] = &[56, 55]; //, 54];
+const DEFAULT_SESSION_IDS: &[u32] = &[56];
 const LATEST_SESSION_ID: u32 = 56;
+
+fn parse_sessions() -> Result<Vec<u32>, Box<dyn Error>> {
+    let sessions = std::env::args()
+        .skip(1)
+        .map(|a| {
+            a.parse::<u32>()
+                .map_err(|_| format!("invalid session id: {a}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(if sessions.is_empty() {
+        DEFAULT_SESSION_IDS.to_vec()
+    } else {
+        sessions
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -357,7 +372,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let client = ScrapingClient::new();
 
-    for &session_id in SESSION_IDS {
+    for session_id in parse_sessions()? {
         if let Err(err) = scrape_session(&client, session_id).await {
             eprintln!(
                 "[meetings-commission] session {} failed entirely: {}",
