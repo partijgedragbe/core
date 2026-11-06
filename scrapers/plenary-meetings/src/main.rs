@@ -797,7 +797,7 @@ async fn extract_questions(
 
     // NOTE: In plenary meeting 145 and 146 of session 56, <p class="Titre1.."/"Titre2.."> is used
     // instead of the usual <h1>/<h2> headings.
-    let allow_p_headings = session_id == 56 && (meeting_id == 145 || meeting_id == 146);
+    let allow_p_headings = session_id == 56 && (meeting_id >= 145);
 
     for element in document.select(selector_h1_or_h2_or_p()) {
         let heading = heading_level(&element, allow_p_headings);
