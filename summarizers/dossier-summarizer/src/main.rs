@@ -1,4 +1,4 @@
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, ListBuilder, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field};
 use arrow::{datatypes::Schema, record_batch::RecordBatch};
 use crawl::paths::{cache_dir, data_dir};
@@ -529,6 +529,118 @@ fn save_report_summary(
     Ok(())
 }
 
+/// A single flattened argument extracted from a dossier's report arguments JSON.
+struct FlatArgumentRow {
+    dossier_id: String,
+    argument_type: &'static str,
+    argument_text: String,
+    probable_parties: Vec<String>,
+}
+
+/// Splits a "parties" field like "Open Vld, MR, N-VA" into individual party names.
+fn split_parties(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Flattens the nested arguments JSON (as stored in dossier_arguments.parquet's
+/// `arguments` column) into one row per individual argument.
+///
+/// Deliberately uncached: every call re-parses the JSON and rebuilds the rows
+/// from scratch, so `arguments.parquet` always reflects exactly what is
+/// currently in `dossier_arguments.parquet` — nothing is diffed or reused.
+fn flatten_report_arguments(
+    cache: &HashMap<String, CachedReportSummaries>,
+) -> Vec<FlatArgumentRow> {
+    let mut rows = Vec::new();
+
+    for cached in cache.values() {
+        let parsed: ReportSummaryJson = match serde_json::from_str(&cached.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[arguments-flatten] WARNING: failed to parse arguments JSON for dossier {}: {e}",
+                    cached.dossier_id
+                );
+                continue;
+            }
+        };
+
+        let sections: [(&'static str, &Vec<PartyArgument>); 3] = [
+            ("for", &parsed.arguments_pro),
+            ("against", &parsed.arguments_contra),
+            ("neutral", &parsed.arguments_neutral),
+        ];
+
+        for (argument_type, arguments) in sections {
+            for arg in arguments {
+                rows.push(FlatArgumentRow {
+                    dossier_id: cached.dossier_id.clone(),
+                    argument_type,
+                    argument_text: arg.argument.clone(),
+                    probable_parties: split_parties(&arg.parties),
+                });
+            }
+        }
+    }
+
+    rows
+}
+
+/// Writes the flattened argument rows to arguments.parquet, overwriting any
+/// existing file each time. `probable_parties` is stored as a native Arrow
+/// List<Utf8> column rather than a delimited string.
+fn save_flat_arguments(
+    path: &Path,
+    rows: &[FlatArgumentRow],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut dossier_ids = Vec::with_capacity(rows.len());
+    let mut argument_types = Vec::with_capacity(rows.len());
+    let mut argument_texts = Vec::with_capacity(rows.len());
+    let mut parties_builder = ListBuilder::new(StringBuilder::new());
+
+    for row in rows {
+        dossier_ids.push(row.dossier_id.clone());
+        argument_types.push(row.argument_type.to_string());
+        argument_texts.push(row.argument_text.clone());
+        for party in &row.probable_parties {
+            parties_builder.values().append_value(party);
+        }
+        parties_builder.append(true);
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("dossier_id", DataType::Utf8, false),
+        Field::new("argument_type", DataType::Utf8, false),
+        Field::new("argument_text", DataType::Utf8, false),
+        Field::new(
+            "probable_parties",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(dossier_ids)),
+            Arc::new(StringArray::from(argument_types)),
+            Arc::new(StringArray::from(argument_texts)),
+            Arc::new(parties_builder.finish()),
+        ],
+    )?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = ArrowWriter::try_new(File::create(path)?, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
 fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
     batch
         .column_by_name(name)
@@ -784,12 +896,13 @@ async fn main() {
     // Optional: pass a single dossier ID as a CLI argument for testing.
     // Dossier IDs to force-regenerate (bypasses the cache/hash check for these).
     // Leave empty (HashSet::new()) to respect caches as normal.
-    let force_regen_ids: HashSet<String> = ["987"].iter().map(|s| s.to_string()).collect();
-    let single_dossier: Option<String> = Some(String::from("987")); //std::env::args().nth(1);
+    let force_regen_ids: HashSet<String> = ["1591"].iter().map(|s| s.to_string()).collect();
+    let single_dossier: Option<String> = Some(String::from("1591")); //std::env::args().nth(1);
     let client = Client::new();
     let dossiers_base = cache_dir().join("sessions/56/dossiers/pdfs");
     let content_out = data_dir().join("summaries/dossier_content.parquet");
     let arguments_out = data_dir().join("summaries/dossier_arguments.parquet");
+    let flat_arguments_out = data_dir().join("summaries/arguments.parquet");
 
     // Shared rate limiter for mistral-large-latest (1 req/s with margin).
     let rate_limiter = Arc::new(RateLimiter::new(1.0));
@@ -1005,8 +1118,18 @@ async fn main() {
         .expect("Failed to write dossier_content.parquet");
     save_report_summary(&arguments_out, &arguments_cache)
         .expect("Failed to write dossier_arguments.parquet");
+
+    // arguments.parquet is always fully regenerated from whatever is now on
+    // disk in dossier_arguments.parquet — no caching or hash check for this
+    // step, it just re-reads and re-flattens the JSON every run.
+    let fresh_arguments_cache = load_existing_report_summaries(&arguments_out);
+    let flat_rows = flatten_report_arguments(&fresh_arguments_cache);
+    let flat_row_count = flat_rows.len();
+    save_flat_arguments(&flat_arguments_out, &flat_rows)
+        .expect("Failed to write arguments.parquet");
+
     println!(
-        "[summarizer] finished: {} new content summaries, {} new argument analyses, {} total API calls",
-        new_content, new_arguments, total_calls
+        "[summarizer] finished: {} new content summaries, {} new argument analyses, {} total API calls, {} flattened argument rows written to arguments.parquet",
+        new_content, new_arguments, total_calls, flat_row_count
     );
 }
